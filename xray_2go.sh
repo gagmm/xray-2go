@@ -23,7 +23,7 @@ client_dir="${work_dir}/url.txt"
 export UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
 export PORT=${PORT:-$(shuf -i 1000-60000 -n 1)}
 export ARGO_PORT=${ARGO_PORT:-'8080'}
-export CFIP=${CFIP:-'www.visa.com.tw'} 
+export CFIP=${CFIP:-'cdns.doon.eu.org'} 
 export CFPORT=${CFPORT:-'443'}   
 
 # 检查是否为root下运行
