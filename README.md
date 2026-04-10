@@ -1,5 +1,5 @@
 # xray-argo无交互一键四协议安装脚本
-最好用的一键xray-argo脚本，一键四协议无交互安装脚本！
+thank to https://github.com/eooce/xray-2go
 * vless-grpc-reality | vless-xhttp-reality | vless-ws-tls(argo) | vmess-ws-tls(argo)
 
 ### 支持系统列表：
