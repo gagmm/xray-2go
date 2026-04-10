@@ -3,6 +3,7 @@
 # ===========================================
 # Xray-2go macOS 适配版 (root 环境，无 Homebrew)
 # 所有依赖直接下载二进制，不依赖 brew
+# 自动选择可用端口，支持导出代理为 txt
 # ===========================================
 
 export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
@@ -27,11 +28,50 @@ work_dir="$HOME/.xray"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 launchd_dir="$HOME/Library/LaunchAgents"
+export_dir="$(pwd)"
 
-# 定义环境变量 - macOS 使用 uuidgen
+# 自动查找可用端口
+find_available_port() {
+    local start_port=${1:-1000}
+    local end_port=${2:-60000}
+    local port
+    for i in $(seq 1 50); do
+        port=$(jot -r 1 "$start_port" "$end_port")
+        if ! lsof -iTCP:"$port" -sTCP:LISTEN &>/dev/null; then
+            echo "$port"
+            return 0
+        fi
+    done
+    red "无法找到可用端口"
+    exit 1
+}
+
+# 自动查找连续可用端口（用于 ARGO_PORT / PORT / GRPC / XHTTP）
+assign_ports() {
+    yellow "正在自动分配可用端口..."
+    export PORT=$(find_available_port 1000 60000)
+    export ARGO_PORT=$(find_available_port 8000 9000)
+    # 确保 ARGO_PORT 与 PORT 不同
+    while [ "$ARGO_PORT" = "$PORT" ]; do
+        export ARGO_PORT=$(find_available_port 8000 9000)
+    done
+    export GRPC_PORT=$(find_available_port 10000 30000)
+    while [ "$GRPC_PORT" = "$PORT" ] || [ "$GRPC_PORT" = "$ARGO_PORT" ]; do
+        export GRPC_PORT=$(find_available_port 10000 30000)
+    done
+    export XHTTP_PORT=$(find_available_port 30001 50000)
+    while [ "$XHTTP_PORT" = "$PORT" ] || [ "$XHTTP_PORT" = "$ARGO_PORT" ] || [ "$XHTTP_PORT" = "$GRPC_PORT" ]; do
+        export XHTTP_PORT=$(find_available_port 30001 50000)
+    done
+    green "端口分配完成："
+    green "  订阅端口 (PORT):       $PORT"
+    green "  Argo 端口 (ARGO_PORT): $ARGO_PORT"
+    green "  GRPC 端口:             $GRPC_PORT"
+    green "  XHTTP 端口:            $XHTTP_PORT"
+}
+
+# 定义环境变量
 export UUID=${UUID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}
-export PORT=${PORT:-$(jot -r 1 1000 60000)}
-export ARGO_PORT=${ARGO_PORT:-'8080'}
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
 
@@ -43,6 +83,49 @@ get_arch() {
         'arm64')  ARCH='arm64'; ARCH_ARG='arm64-v8a' ;;
         *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
     esac
+}
+
+# 获取真实 IP - 多 API 兜底
+get_realip() {
+    local apis=(
+        "ifconfig.me"
+        "api.ipify.org"
+        "icanhazip.com"
+        "ipecho.net/plain"
+        "checkip.amazonaws.com"
+        "ipv4.ip.sb"
+    )
+
+    local ip=""
+    for api in "${apis[@]}"; do
+        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return
+        fi
+    done
+
+    # IPv4 全部失败，尝试 IPv6
+    local ipv6_apis=(
+        "api64.ipify.org"
+        "ipv6.ip.sb"
+    )
+    for api in "${ipv6_apis[@]}"; do
+        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$ip" ]; then
+            echo "[$ip]"
+            return
+        fi
+    done
+
+    # 全部失败，手动输入
+    red "无法自动获取公网 IP"
+    reading "请手动输入你的服务器公网 IP: " manual_ip
+    if [ -n "$manual_ip" ]; then
+        echo "$manual_ip"
+    else
+        echo "127.0.0.1"
+    fi
 }
 
 # 检查 xray 是否已安装和运行
@@ -93,7 +176,7 @@ check_caddy() {
     fi
 }
 
-# 安装依赖 - 直接下载二进制，不使用 brew
+# 安装依赖 - 直接下载二进制
 manage_packages() {
     if [ $# -lt 2 ]; then
         red "未指定包名或操作"
@@ -170,50 +253,6 @@ QREOF
     return 0
 }
 
-# 获取真实 IP
-get_realip() {
-    local apis=(
-        "ifconfig.me"
-        "api.ipify.org"
-        "icanhazip.com"
-        "ipecho.net/plain"
-        "checkip.amazonaws.com"
-        "ipv4.ip.sb"
-    )
-    
-    local ip=""
-    for api in "${apis[@]}"; do
-        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return
-        fi
-    done
-
-    # IPv4 全部失败，尝试 IPv6
-    local ipv6_apis=(
-        "api64.ipify.org"
-        "ipv6.ip.sb"
-    )
-    for api in "${ipv6_apis[@]}"; do
-        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
-        if [ -n "$ip" ]; then
-            echo "[$ip]"
-            return
-        fi
-    done
-
-    # 全部失败，手动输入
-    red "无法自动获取公网 IP"
-    reading "请手动输入你的服务器公网 IP: " manual_ip
-    if [ -n "$manual_ip" ]; then
-        echo "$manual_ip"
-    else
-        echo "127.0.0.1"
-    fi
-}
-
-
 # 安装 caddy - 直接下载二进制
 install_caddy() {
     if command -v caddy &>/dev/null; then
@@ -223,7 +262,6 @@ install_caddy() {
     yellow "正在下载安装 caddy..."
     get_arch
 
-    # 获取最新版本号
     CADDY_VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
     if [ -z "$CADDY_VERSION" ]; then
         CADDY_VERSION="2.9.1"
@@ -255,6 +293,9 @@ install_xray() {
     purple "正在安装 Xray-2go (macOS) 中，请稍等..."
     get_arch
 
+    # 自动分配端口
+    assign_ports
+
     # 创建工作目录
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 755 "${work_dir}"
     [ ! -d "${launchd_dir}" ] && mkdir -p "${launchd_dir}"
@@ -267,7 +308,7 @@ install_xray() {
         exit 1
     fi
 
-    # 下载 cloudflared (macOS 版本) - 直接下载二进制
+    # 下载 cloudflared
     yellow "下载 cloudflared..."
     curl -sLo "/tmp/cloudflared.tgz" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}.tgz"
     if [ $? -eq 0 ]; then
@@ -277,7 +318,6 @@ install_xray() {
         fi
         rm -f /tmp/cloudflared.tgz
     else
-        # 备用：直接下载非压缩版
         yellow "尝试备用下载方式..."
         curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}"
     fi
@@ -306,8 +346,6 @@ install_xray() {
 
     # 生成随机密码
     password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
-    GRPC_PORT=$(($PORT + 1))
-    XHTTP_PORT=$(($PORT + 2))
 
     # 生成 x25519 密钥对
     output=$("${work_dir}/xray" x25519 2>&1)
@@ -321,6 +359,18 @@ install_xray() {
     fi
 
     green "密钥对生成成功"
+
+    # 保存端口和密码信息到文件（供后续函数读取）
+    cat > "${work_dir}/ports.env" << EOF
+PORT=$PORT
+ARGO_PORT=$ARGO_PORT
+GRPC_PORT=$GRPC_PORT
+XHTTP_PORT=$XHTTP_PORT
+password=$password
+private_key=$private_key
+public_key=$public_key
+UUID=$UUID
+EOF
 
     # 生成配置文件
     cat > "${config_dir}" << EOF
@@ -382,9 +432,16 @@ EOF
     green "配置文件已生成"
 }
 
+# 加载保存的端口配置
+load_ports() {
+    if [ -f "${work_dir}/ports.env" ]; then
+        source "${work_dir}/ports.env"
+    fi
+}
+
 # macOS launchd 守护进程
 macos_launchd_services() {
-    # Xray 服务
+    load_ports
     cat > "${launchd_dir}/com.xray.service.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -411,7 +468,6 @@ macos_launchd_services() {
 </plist>
 EOF
 
-    # Cloudflare Tunnel 服务
     cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -443,7 +499,6 @@ EOF
 </plist>
 EOF
 
-    # 加载服务
     launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
     launchctl load -w "${launchd_dir}/com.xray.service.plist"
     launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
@@ -455,7 +510,7 @@ EOF
 macos_caddy_launchd() {
     local caddy_path
     caddy_path=$(which caddy 2>/dev/null || echo "/usr/local/bin/caddy")
-    
+
     cat > "${launchd_dir}/com.caddy.service.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -485,31 +540,35 @@ EOF
 
 get_info() {
     clear
+    load_ports
     IP=$(get_realip)
 
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "vps")
 
     if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..8}; do
+        for i in {1..10}; do
             purple "第 $i 次尝试获取 ArgoDomain 中..."
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
             [ -n "$argodomain" ] && break
             sleep 3
         done
     else
         restart_argo
         sleep 8
-        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        for i in {1..5}; do
+            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+            [ -n "$argodomain" ] && break
+            sleep 3
+        done
     fi
 
     if [ -z "$argodomain" ]; then
-        red "获取 Argo 临时域名失败，请稍后重试（选择菜单4 -> 5重新获取）"
+        red "获取 Argo 临时域名失败，请稍后重试（菜单4 -> 5重新获取）"
         argodomain="获取失败请重试"
     fi
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
-    # macOS base64 不支持 -w0
     cat > ${work_dir}/url.txt <<EOF
 vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
 
@@ -523,7 +582,6 @@ EOF
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
 
-    # macOS base64 编码并去除换行
     base64 -i ${work_dir}/url.txt -o ${work_dir}/sub_tmp.txt
     tr -d '\n' < ${work_dir}/sub_tmp.txt > ${work_dir}/sub.txt
     rm -f ${work_dir}/sub_tmp.txt
@@ -533,10 +591,14 @@ EOF
     green "订阅二维码"
     ${work_dir}/qrencode "http://$IP:$PORT/$password"
     echo ""
+
+    # 安装完成后自动导出一份到桌面
+    export_proxy_txt "auto"
 }
 
 # caddy 订阅配置
 add_caddy_conf() {
+    load_ports
     cat > "${work_dir}/Caddyfile" << EOF
 {
     auto_https off
@@ -572,6 +634,210 @@ EOF
     else
         red "Caddy 配置文件验证失败，订阅功能可能无法使用，但不影响节点使用"
     fi
+}
+
+# ==========================================
+# 导出代理为 txt 功能
+# ==========================================
+export_proxy_txt() {
+    local mode="${1:-manual}"
+    load_ports
+
+    if [ ! -f "${work_dir}/url.txt" ]; then
+        red "节点文件不存在，请先安装 Xray-2go"
+        return 1
+    fi
+
+    local IP=$(get_realip)
+    local timestamp=$(date '+%Y%m%d_%H%M%S')
+    local export_file="${export_dir}/xray2go_proxy_${timestamp}.txt"
+    local export_file_latest="${export_dir}/xray2go_proxy_latest.txt"
+
+    # 读取 argo 域名
+    local argodomain=""
+    if [ -f "${work_dir}/argo.log" ]; then
+        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+    fi
+
+    # 读取订阅链接信息
+    local sub_port="$PORT"
+    local sub_path="$password"
+    if [ -f "${work_dir}/Caddyfile" ]; then
+        sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
+        sub_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
+    fi
+
+    cat > "$export_file" << EXPORTEOF
+============================================
+  Xray-2go 代理节点信息
+  导出时间: $(date '+%Y-%m-%d %H:%M:%S')
+  服务器IP: ${IP}
+============================================
+
+【端口信息】
+  订阅端口:  ${sub_port}
+  Argo端口:  ${ARGO_PORT}
+  GRPC端口:  ${GRPC_PORT}
+  XHTTP端口: ${XHTTP_PORT}
+
+【UUID】
+  ${UUID}
+
+【Argo 域名】
+  ${argodomain:-未获取到}
+
+============================================
+  节点链接（可直接导入客户端）
+============================================
+
+--- VLESS GRPC Reality ---
+$(sed -n '1p' "${work_dir}/url.txt")
+
+--- VLESS XHTTP Reality ---
+$(sed -n '3p' "${work_dir}/url.txt")
+
+--- VLESS WS (Argo) ---
+$(sed -n '5p' "${work_dir}/url.txt")
+
+--- VMess WS (Argo) ---
+$(sed -n '7p' "${work_dir}/url.txt")
+
+============================================
+  订阅链接
+============================================
+
+http://${IP}:${sub_port}/${sub_path}
+
+============================================
+  使用说明
+============================================
+
+1. Reality 节点 (GRPC/XHTTP):
+   - 直连服务器 IP，无需域名
+   - 适合 IP 未被墙的情况
+
+2. Argo 节点 (VLESS-WS/VMess-WS):
+   - 通过 Cloudflare CDN 中转
+   - 适合 IP 被墙的情况
+   - 临时隧道域名每次重启会变化
+
+3. 订阅链接:
+   - 可导入 V2rayN, NekoBox, Karing,
+     Shadowrocket, Quantumult X, Loon 等
+   - 更新订阅即可获取最新节点
+
+4. 客户端推荐:
+   - iOS: Shadowrocket / Quantumult X / Loon
+   - Android: V2rayNG / NekoBox / Karing
+   - Windows: V2rayN / Clash Verge
+   - macOS: V2rayU / ClashX Pro
+
+============================================
+EXPORTEOF
+
+    # 同时生成一份 latest 版本（覆盖）
+    cp "$export_file" "$export_file_latest"
+
+    # 同时导出一份纯链接版本（方便复制）
+    local links_file="${export_dir}/xray2go_links_${timestamp}.txt"
+    local links_file_latest="${export_dir}/xray2go_links_latest.txt"
+
+    grep -v '^$' "${work_dir}/url.txt" > "$links_file"
+    echo "" >> "$links_file"
+    echo "# 订阅链接" >> "$links_file"
+    echo "http://${IP}:${sub_port}/${sub_path}" >> "$links_file"
+
+    cp "$links_file" "$links_file_latest"
+
+    if [ "$mode" = "auto" ]; then
+        green "\n代理信息已自动导出到桌面："
+    else
+        green "\n代理信息已导出到桌面："
+    fi
+    green "  详细版: ${export_file}"
+    green "  详细版(latest): ${export_file_latest}"
+    green "  纯链接: ${links_file}"
+    green "  纯链接(latest): ${links_file_latest}\n"
+}
+
+# 导出菜单
+export_menu() {
+    check_xray &>/dev/null
+    local xray_status=$?
+    if [ $xray_status -ne 0 ] && [ ! -f "${work_dir}/url.txt" ]; then
+        yellow "Xray-2go 尚未安装，无节点可导出"
+        sleep 1
+        return
+    fi
+
+    clear
+    echo ""
+    green "1. 导出到桌面 (详细版 + 纯链接版)"
+    skyblue "-----------------------------------"
+    green "2. 导出到自定义路径"
+    skyblue "-----------------------------------"
+    green "3. 在终端显示所有节点链接"
+    skyblue "-----------------------------------"
+    green "4. 复制订阅链接到剪贴板"
+    skyblue "-----------------------------------"
+    purple "5. 返回主菜单"
+    skyblue "-----------------------------------"
+    reading "请输入选择: " choice
+    case "${choice}" in
+        1)
+            export_proxy_txt "manual"
+            ;;
+        2)
+            reading "请输入导出路径 (如 /tmp): " custom_path
+            if [ -z "$custom_path" ]; then
+                custom_path="$export_dir"
+            fi
+            if [ ! -d "$custom_path" ]; then
+                mkdir -p "$custom_path" 2>/dev/null
+                if [ $? -ne 0 ]; then
+                    red "路径创建失败: $custom_path"
+                    return
+                fi
+            fi
+            local old_export_dir="$export_dir"
+            export_dir="$custom_path"
+            export_proxy_txt "manual"
+            export_dir="$old_export_dir"
+            ;;
+        3)
+            echo ""
+            green "========== 所有节点链接 =========="
+            echo ""
+            while IFS= read -r line; do
+                [ -n "$line" ] && echo -e "${purple}$line${re}"
+            done < ${work_dir}/url.txt
+
+            load_ports
+            local server_ip=$(get_realip)
+            local s_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
+            local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
+            echo ""
+            green "========== 订阅链接 =========="
+            green "http://$server_ip:$s_port/$s_path"
+            echo ""
+            green "================================"
+            ;;
+        4)
+            load_ports
+            local server_ip=$(get_realip)
+            local s_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
+            local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
+            local sub_link="http://$server_ip:$s_port/$s_path"
+            echo -n "$sub_link" | pbcopy 2>/dev/null
+            if [ $? -eq 0 ]; then
+                green "\n订阅链接已复制到剪贴板：$sub_link\n"
+            else
+                yellow "\n剪贴板复制失败，请手动复制：\n$sub_link\n"
+            fi
+            ;;
+        5) return ;;
+        *) red "无效的选项！" ;;
+    esac
 }
 
 # 启动 xray
@@ -712,7 +978,6 @@ uninstall_xray() {
     case "${choice}" in
         y|Y)
             yellow "正在卸载 xray"
-            # 停止并卸载 launchd 服务
             launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
             launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
             launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
@@ -721,7 +986,6 @@ uninstall_xray() {
             rm -f "${launchd_dir}/com.cloudflare.tunnel.plist"
             rm -f "${launchd_dir}/com.caddy.service.plist"
 
-            # 删除快捷方式
             rm -f /usr/local/bin/2go 2>/dev/null
 
             reading "\n是否卸载 caddy？(y/n): " choice
@@ -736,7 +1000,6 @@ uninstall_xray() {
                 *) yellow "取消卸载 jq\n" ;;
             esac
 
-            # 删除工作目录
             rm -rf "${work_dir}"
 
             green "\nXray_2go 卸载成功\n"
@@ -765,6 +1028,7 @@ EOF
 
 # 变更配置
 change_config() {
+    load_ports
     clear
     echo ""
     green "1. 修改UUID"
@@ -785,6 +1049,8 @@ change_config() {
             sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$config_dir"
             restart_xray
             sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$client_dir"
+            # 更新 ports.env 中的 UUID
+            sed -i '' "s/^UUID=.*/UUID=$new_uuid/" "${work_dir}/ports.env"
             content=$(cat "$client_dir")
             vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
             vmess_prefix="vmess://"
@@ -804,14 +1070,15 @@ change_config() {
             green "\nUUID已修改为：${purple}${new_uuid}${re} ${green}请更新订阅或手动更改所有节点的UUID${re}\n"
             ;;
         2)
-            reading "\n请输入grpc-reality端口 (回车跳过将使用随机端口): " new_port
-            [ -z "$new_port" ] && new_port=$(jot -r 1 2000 65000)
+            reading "\n请输入grpc-reality端口 (回车跳过将自动分配): " new_port
+            [ -z "$new_port" ] && new_port=$(find_available_port 2000 65000)
             until [[ -z $(lsof -iTCP:$new_port -sTCP:LISTEN 2>/dev/null) ]]; do
                 echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
                 reading "请输入新的端口(1-65535):" new_port
-                [[ -z $new_port ]] && new_port=$(jot -r 1 2000 65000)
+                [[ -z $new_port ]] && new_port=$(find_available_port 2000 65000)
             done
             sed -i '' "41s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
+            sed -i '' "s/^GRPC_PORT=.*/GRPC_PORT=$new_port/" "${work_dir}/ports.env"
             restart_xray
             sed -i '' '1s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
             base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
@@ -821,14 +1088,15 @@ change_config() {
             green "\nGRPC-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改grpc-reality节点端口${re}\n"
             ;;
         3)
-            reading "\n请输入xhttp-reality端口 (回车跳过将使用随机端口): " new_port
-            [ -z "$new_port" ] && new_port=$(jot -r 1 2000 65000)
+            reading "\n请输入xhttp-reality端口 (回车跳过将自动分配): " new_port
+            [ -z "$new_port" ] && new_port=$(find_available_port 2000 65000)
             until [[ -z $(lsof -iTCP:$new_port -sTCP:LISTEN 2>/dev/null) ]]; do
                 echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
                 reading "请输入新的端口(1-65535):" new_port
-                [[ -z $new_port ]] && new_port=$(jot -r 1 2000 65000)
+                [[ -z $new_port ]] && new_port=$(find_available_port 2000 65000)
             done
             sed -i '' "35s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
+            sed -i '' "s/^XHTTP_PORT=.*/XHTTP_PORT=$new_port/" "${work_dir}/ports.env"
             restart_xray
             sed -i '' '3s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
             base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
@@ -895,27 +1163,29 @@ disable_open_sub() {
             2)
                 green "\n已开启节点订阅\n"
                 server_ip=$(get_realip)
-                password=$(LC_ALL=C tr -dc A-Za-z < /dev/urandom | head -c 32)
-                sed -i '' "s/\/[a-zA-Z0-9]\{1,\}/\/$password/g" "${work_dir}/Caddyfile"
+                new_password=$(LC_ALL=C tr -dc A-Za-z < /dev/urandom | head -c 32)
+                sed -i '' "s/\/[a-zA-Z0-9]\{1,\}/\/$new_password/g" "${work_dir}/Caddyfile"
                 sub_port=$(grep -oE ':[0-9]+' "${work_dir}/Caddyfile" | head -1 | tr -d ':')
                 start_caddy
                 if [ "$sub_port" = "80" ]; then
-                    link="http://$server_ip/$password"
+                    link="http://$server_ip/$new_password"
                 else
                     green "订阅端口：$sub_port"
-                    link="http://$server_ip:$sub_port/$password"
+                    link="http://$server_ip:$sub_port/$new_password"
                 fi
                 green "\n新的节点订阅链接：$link\n"
                 ;;
             3)
                 reading "请输入新的订阅端口(1-65535):" sub_port
-                [ -z "$sub_port" ] && sub_port=$(jot -r 1 2000 65000)
+                [ -z "$sub_port" ] && sub_port=$(find_available_port 2000 65000)
                 until [[ -z $(lsof -iTCP:$sub_port -sTCP:LISTEN 2>/dev/null) ]]; do
                     echo -e "${red}${sub_port}端口已经被其他程序占用，请更换端口重试${re}"
                     reading "请输入新的订阅端口(1-65535):" sub_port
-                    [[ -z $sub_port ]] && sub_port=$(jot -r 1 2000 65000)
+                    [[ -z $sub_port ]] && sub_port=$(find_available_port 2000 65000)
                 done
                 sed -i '' "s/:[0-9]\{1,\}/:$sub_port/g" "${work_dir}/Caddyfile"
+                # 更新 ports.env
+                sed -i '' "s/^PORT=.*/PORT=$sub_port/" "${work_dir}/ports.env"
                 path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile")
                 server_ip=$(get_realip)
                 restart_caddy
@@ -957,15 +1227,19 @@ get_quick_tunnel() {
     yellow "获取临时 argo 域名中，请稍等...\n"
     sleep 5
     if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..8}; do
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        for i in {1..10}; do
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
             [ -n "$get_argodomain" ] && break
             sleep 3
         done
     else
         restart_argo
         sleep 8
-        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+        for i in {1..5}; do
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+            [ -n "$get_argodomain" ] && break
+            sleep 3
+        done
     fi
     if [ -n "$get_argodomain" ]; then
         green "ArgoDomain：${purple}$get_argodomain${re}\n"
@@ -1033,7 +1307,8 @@ manage_argo() {
         2) stop_argo ;;
         3)
             clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为8080，自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+            load_ports
+            yellow "\n固定隧道可为json或token，固定隧道端口为${ARGO_PORT}，自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
             reading "\n请输入你的argo域名: " argo_domain
             green "你的Argo域名为：$argo_domain"
             ArgoDomain=$argo_domain
@@ -1047,7 +1322,7 @@ protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
-    service: http://localhost:8080
+    service: http://localhost:${ARGO_PORT}
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -1123,6 +1398,7 @@ PEOF
             ;;
         4)
             clear
+            load_ports
             macos_launchd_services
             get_quick_tunnel
             change_argo_domain
@@ -1146,6 +1422,7 @@ check_nodes() {
     check_xray &>/dev/null
     local xray_status=$?
     if [ $xray_status -eq 0 ]; then
+        load_ports
         while IFS= read -r line; do purple "$line"; done < ${work_dir}/url.txt
         server_ip=$(get_realip)
         sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
@@ -1189,9 +1466,11 @@ menu() {
         green "6. 修改节点配置"
         green "7. 管理节点订阅"
         echo "==============="
+        skyblue "8. 导出代理为txt"
+        echo "==============="
         red "0. 退出脚本"
         echo "==========="
-        reading "请输入选择(0-7): " choice
+        reading "请输入选择(0-8): " choice
         echo ""
         case "${choice}" in
             1)
@@ -1214,8 +1493,9 @@ menu() {
             5) check_nodes ;;
             6) change_config ;;
             7) disable_open_sub ;;
+            8) export_menu ;;
             0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 7" ;;
+            *) red "无效的选项，请输入 0 到 8" ;;
         esac
         read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
     done
