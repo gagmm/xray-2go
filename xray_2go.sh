@@ -1,10 +1,11 @@
 #!/bin/bash
 
 # ===========================================
-# Xray-2go macOS 适配版
-# 原脚本适用于 Linux，此版本适配 macOS
-# 需要预装 Homebrew (https://brew.sh)
+# Xray-2go macOS 适配版 (root 环境，无 Homebrew)
+# 所有依赖直接下载二进制，不依赖 brew
 # ===========================================
+
+export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 # 定义颜色
 re="\033[0m"
@@ -20,27 +21,28 @@ purple() { echo -e "\033[1;35m$1\033[0m"; }
 skyblue() { echo -e "\033[1;36m$1\033[0m"; }
 reading() { read -p "$(red "$1")" "$2"; }
 
-# 定义常量 - macOS 使用用户目录
+# 定义常量
 server_name="xray"
 work_dir="$HOME/.xray"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 launchd_dir="$HOME/Library/LaunchAgents"
 
-# 定义环境变量 - macOS 使用 uuidgen 代替 /proc/sys/kernel/random/uuid
+# 定义环境变量 - macOS 使用 uuidgen
 export UUID=${UUID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}
 export PORT=${PORT:-$(jot -r 1 1000 60000)}
 export ARGO_PORT=${ARGO_PORT:-'8080'}
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
 
-# macOS 不需要 root，但需要 Homebrew
-check_homebrew() {
-    if ! command -v brew &>/dev/null; then
-        red "请先安装 Homebrew: https://brew.sh"
-        red '运行: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
-        exit 1
-    fi
+# 获取系统架构
+get_arch() {
+    ARCH_RAW=$(uname -m)
+    case "${ARCH_RAW}" in
+        'x86_64') ARCH='amd64'; ARCH_ARG='64' ;;
+        'arm64')  ARCH='arm64'; ARCH_ARG='arm64-v8a' ;;
+        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+    esac
 }
 
 # 检查 xray 是否已安装和运行
@@ -77,7 +79,7 @@ check_argo() {
 
 # 检查 caddy 是否已安装
 check_caddy() {
-    if command -v caddy &>/dev/null; then
+    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
         if launchctl list 2>/dev/null | grep -q "com.caddy.service"; then
             green "running"
             return 0
@@ -91,7 +93,7 @@ check_caddy() {
     fi
 }
 
-# macOS 包管理 - 使用 Homebrew
+# 安装依赖 - 直接下载二进制，不使用 brew
 manage_packages() {
     if [ $# -lt 2 ]; then
         red "未指定包名或操作"
@@ -101,33 +103,68 @@ manage_packages() {
     action=$1
     shift
 
-    for package in "$@"; do
-        # 某些包在 brew 中名称不同
-        brew_name="$package"
-        case "$package" in
-            "lsof") continue ;; # macOS 自带 lsof
-            "openssl") brew_name="openssl" ;;
-            "coreutils") brew_name="coreutils" ;;
-            "iptables") continue ;; # macOS 不用 iptables
-        esac
+    get_arch
 
+    for package in "$@"; do
         if [ "$action" == "install" ]; then
-            if command -v "$package" &>/dev/null || brew list "$brew_name" &>/dev/null; then
+            case "$package" in
+                lsof|openssl|coreutils|iptables|unzip)
+                    green "${package} macOS 自带或不需要，跳过"
+                    continue
+                    ;;
+            esac
+
+            if command -v "$package" &>/dev/null; then
                 green "${package} already installed"
                 continue
             fi
-            yellow "正在安装 ${brew_name}..."
-            brew install "$brew_name"
+
+            yellow "正在安装 ${package}..."
+            case "$package" in
+                jq)
+                    curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/latest/download/jq-macos-${ARCH}"
+                    chmod +x /usr/local/bin/jq
+                    xattr -d com.apple.quarantine /usr/local/bin/jq 2>/dev/null
+                    if command -v jq &>/dev/null; then
+                        green "jq 安装成功"
+                    else
+                        red "jq 安装失败"
+                    fi
+                    ;;
+                qrencode)
+                    cat > "${work_dir}/qrencode" << 'QREOF'
+#!/bin/bash
+echo ""
+echo "========== 订阅二维码 =========="
+echo "(macOS root 环境暂不支持终端二维码)"
+echo "请复制以下链接到浏览器或手机扫码工具："
+echo ""
+echo "$1"
+echo ""
+echo "================================"
+QREOF
+                    chmod +x "${work_dir}/qrencode"
+                    green "qrencode 替代脚本已创建"
+                    ;;
+                *)
+                    yellow "${package} 跳过安装"
+                    ;;
+            esac
+
         elif [ "$action" == "uninstall" ]; then
-            if ! brew list "$brew_name" &>/dev/null; then
-                yellow "${package} is not installed"
-                continue
-            fi
-            yellow "正在卸载 ${brew_name}..."
-            brew uninstall "$brew_name"
-        else
-            red "Unknown action: $action"
-            return 1
+            case "$package" in
+                jq)
+                    rm -f /usr/local/bin/jq
+                    green "jq 已卸载"
+                    ;;
+                caddy)
+                    rm -f /usr/local/bin/caddy
+                    green "caddy 已卸载"
+                    ;;
+                *)
+                    yellow "${package} 跳过卸载"
+                    ;;
+            esac
         fi
     done
     return 0
@@ -149,27 +186,46 @@ get_realip() {
     fi
 }
 
+# 安装 caddy - 直接下载二进制
+install_caddy() {
+    if command -v caddy &>/dev/null; then
+        green "caddy already installed"
+        return
+    fi
+    yellow "正在下载安装 caddy..."
+    get_arch
+
+    # 获取最新版本号
+    CADDY_VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
+    if [ -z "$CADDY_VERSION" ]; then
+        CADDY_VERSION="2.9.1"
+    fi
+
+    curl -sLo /tmp/caddy.tar.gz "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_mac_${ARCH}.tar.gz"
+    if [ $? -ne 0 ]; then
+        red "caddy 下载失败"
+        return 1
+    fi
+
+    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
+    tar -xzf /tmp/caddy.tar.gz -C /tmp/ 2>/dev/null
+    mv /tmp/caddy /usr/local/bin/caddy 2>/dev/null
+    chmod +x /usr/local/bin/caddy
+    xattr -d com.apple.quarantine /usr/local/bin/caddy 2>/dev/null
+    rm -f /tmp/caddy.tar.gz /tmp/LICENSE /tmp/README.md
+
+    if command -v caddy &>/dev/null; then
+        green "caddy v${CADDY_VERSION} 安装成功"
+    else
+        red "caddy 安装失败"
+    fi
+}
+
 # 下载并安装 xray, cloudflared
 install_xray() {
     clear
     purple "正在安装 Xray-2go (macOS) 中，请稍等..."
-    ARCH_RAW=$(uname -m)
-    case "${ARCH_RAW}" in
-        'x86_64')
-            ARCH='amd64'
-            ARCH_ARG='64'
-            CF_ARCH='amd64'
-            ;;
-        'arm64')
-            ARCH='arm64'
-            ARCH_ARG='arm64-v8a'
-            CF_ARCH='arm64'
-            ;;
-        *)
-            red "不支持的架构: ${ARCH_RAW}"
-            exit 1
-            ;;
-    esac
+    get_arch
 
     # 创建工作目录
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 755 "${work_dir}"
@@ -183,38 +239,42 @@ install_xray() {
         exit 1
     fi
 
-    # 下载 cloudflared (macOS 版本)
+    # 下载 cloudflared (macOS 版本) - 直接下载二进制
     yellow "下载 cloudflared..."
-    if [ "$ARCH_RAW" = "arm64" ]; then
-        # Apple Silicon
-        brew install cloudflare/cloudflare/cloudflared 2>/dev/null || \
-        curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64"
+    curl -sLo "/tmp/cloudflared.tgz" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}.tgz"
+    if [ $? -eq 0 ]; then
+        tar -xzf /tmp/cloudflared.tgz -C "${work_dir}/" 2>/dev/null
+        if [ -f "${work_dir}/cloudflared" ]; then
+            mv "${work_dir}/cloudflared" "${work_dir}/argo"
+        fi
+        rm -f /tmp/cloudflared.tgz
     else
-        curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64"
+        # 备用：直接下载非压缩版
+        yellow "尝试备用下载方式..."
+        curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}"
     fi
-
-    # 如果通过 brew 安装了 cloudflared，创建软链接
-    if command -v cloudflared &>/dev/null && [ ! -f "${work_dir}/argo" ]; then
-        ln -sf "$(which cloudflared)" "${work_dir}/argo"
-    fi
-
-    # 下载 qrencode（macOS 通过 brew 安装）
-    brew install qrencode 2>/dev/null
-    # 创建 qrencode 包装脚本
-    cat > "${work_dir}/qrencode" << 'QREOF'
-#!/bin/bash
-qrencode -t ANSIUTF8 "$1"
-QREOF
-    chmod +x "${work_dir}/qrencode"
 
     # 解压 xray
     unzip -o "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1
-    chmod +x ${work_dir}/${server_name} ${work_dir}/argo 2>/dev/null
-    rm -rf "${work_dir}/${server_name}.zip" "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" "${work_dir}/README.md" "${work_dir}/LICENSE"
+    chmod +x "${work_dir}/${server_name}" "${work_dir}/argo" 2>/dev/null
 
-    # 解除 macOS quarantine 属性（否则会被 Gatekeeper 阻止）
+    # 解除 macOS quarantine
     xattr -d com.apple.quarantine "${work_dir}/${server_name}" 2>/dev/null
     xattr -d com.apple.quarantine "${work_dir}/argo" 2>/dev/null
+
+    rm -rf "${work_dir}/${server_name}.zip" "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" "${work_dir}/README.md" "${work_dir}/LICENSE"
+
+    # 验证文件
+    if [ ! -f "${work_dir}/${server_name}" ]; then
+        red "Xray 二进制文件不存在，安装失败"
+        exit 1
+    fi
+    if [ ! -f "${work_dir}/argo" ]; then
+        red "cloudflared 二进制文件不存在，安装失败"
+        exit 1
+    fi
+
+    green "Xray 和 cloudflared 下载完成"
 
     # 生成随机密码
     password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
@@ -222,14 +282,17 @@ QREOF
     XHTTP_PORT=$(($PORT + 2))
 
     # 生成 x25519 密钥对
-    output=$("${work_dir}/xray" x25519)
-    private_key=$(echo "${output}" | grep "Private key:" | awk '{print $3}')
-    public_key=$(echo "${output}" | grep "Public key:" | awk '{print $3}')
-    # 兼容不同版本的输出格式
-    if [ -z "$private_key" ]; then
-        private_key=$(echo "${output}" | grep "PrivateKey:" | awk '{print $2}')
-        public_key=$(echo "${output}" | grep "PublicKey:" | awk '{print $2}')
+    output=$("${work_dir}/xray" x25519 2>&1)
+    private_key=$(echo "${output}" | grep -i "private" | awk '{print $NF}')
+    public_key=$(echo "${output}" | grep -i "public" | awk '{print $NF}')
+
+    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
+        red "x25519 密钥生成失败，输出如下："
+        echo "$output"
+        exit 1
     fi
+
+    green "密钥对生成成功"
 
     # 生成配置文件
     cat > "${config_dir}" << EOF
@@ -288,6 +351,7 @@ QREOF
   ]
 }
 EOF
+    green "配置文件已生成"
 }
 
 # macOS launchd 守护进程
@@ -356,10 +420,14 @@ EOF
     launchctl load -w "${launchd_dir}/com.xray.service.plist"
     launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
     launchctl load -w "${launchd_dir}/com.cloudflare.tunnel.plist"
+    green "launchd 服务已加载"
 }
 
-# Caddy 服务 plist
+# Caddy launchd 服务
 macos_caddy_launchd() {
+    local caddy_path
+    caddy_path=$(which caddy 2>/dev/null || echo "/usr/local/bin/caddy")
+    
     cat > "${launchd_dir}/com.caddy.service.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -369,7 +437,7 @@ macos_caddy_launchd() {
     <string>com.caddy.service</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$(which caddy)</string>
+        <string>${caddy_path}</string>
         <string>run</string>
         <string>--config</string>
         <string>${work_dir}/Caddyfile</string>
@@ -394,21 +462,26 @@ get_info() {
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "vps")
 
     if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..5}; do
+        for i in {1..8}; do
             purple "第 $i 次尝试获取 ArgoDomain 中..."
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
             [ -n "$argodomain" ] && break
-            sleep 2
+            sleep 3
         done
     else
         restart_argo
-        sleep 6
+        sleep 8
         argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+    fi
+
+    if [ -z "$argodomain" ]; then
+        red "获取 Argo 临时域名失败，请稍后重试（选择菜单4 -> 5重新获取）"
+        argodomain="获取失败请重试"
     fi
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
-    # macOS base64 不支持 -w0，使用不换行方式
+    # macOS base64 不支持 -w0
     cat > ${work_dir}/url.txt <<EOF
 vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
 
@@ -421,28 +494,20 @@ vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port
 EOF
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-    # macOS base64 编码（无 -w0 参数）
-    base64 -i ${work_dir}/url.txt -o ${work_dir}/sub.txt
-    # 去除换行
-    tr -d '\n' < ${work_dir}/sub.txt > ${work_dir}/sub_tmp.txt && mv ${work_dir}/sub_tmp.txt ${work_dir}/sub.txt
+
+    # macOS base64 编码并去除换行
+    base64 -i ${work_dir}/url.txt -o ${work_dir}/sub_tmp.txt
+    tr -d '\n' < ${work_dir}/sub_tmp.txt > ${work_dir}/sub.txt
+    rm -f ${work_dir}/sub_tmp.txt
+
     yellow "\n温馨提醒：如果是 NAT 机，reality 端口和订阅端口需使用可用端口范围内的端口\n"
     green "节点订阅链接：http://$IP:$PORT/$password\n\n订阅链接适用于 V2rayN, Nekbox, karing, Sterisand, Loon, 小火箭, 圈X 等\n"
     green "订阅二维码"
-    qrencode -t ANSIUTF8 "http://$IP:$PORT/$password" 2>/dev/null || yellow "（请安装 qrencode 以显示二维码: brew install qrencode）"
+    ${work_dir}/qrencode "http://$IP:$PORT/$password"
     echo ""
 }
 
-# 安装 caddy（macOS 通过 brew）
-install_caddy() {
-    if command -v caddy &>/dev/null; then
-        green "caddy already installed"
-    else
-        yellow "正在通过 Homebrew 安装 caddy..."
-        brew install caddy
-    fi
-}
-
-# caddy 订阅配置 - macOS 版本路径放在 work_dir 下
+# caddy 订阅配置
 add_caddy_conf() {
     cat > "${work_dir}/Caddyfile" << EOF
 {
@@ -475,6 +540,7 @@ EOF
         macos_caddy_launchd
         launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
         launchctl load -w "${launchd_dir}/com.caddy.service.plist"
+        green "Caddy 服务已启动"
     else
         red "Caddy 配置文件验证失败，订阅功能可能无法使用，但不影响节点使用"
     fi
@@ -495,10 +561,8 @@ start_xray() {
         fi
     elif [ $status -eq 0 ]; then
         yellow "xray 正在运行\n"
-        sleep 1
     else
         yellow "xray 尚未安装!\n"
-        sleep 1
     fi
 }
 
@@ -576,7 +640,7 @@ restart_argo() {
     local status=$?
     if [ $status -eq 0 ] || [ $status -eq 1 ]; then
         yellow "\n正在重启 Argo 服务\n"
-        rm "${work_dir}/argo.log" 2>/dev/null
+        rm -f "${work_dir}/argo.log" 2>/dev/null
         launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
         sleep 1
         launchctl load -w "${launchd_dir}/com.cloudflare.tunnel.plist"
@@ -589,7 +653,7 @@ restart_argo() {
 
 # 启动 caddy
 start_caddy() {
-    if command -v caddy &>/dev/null; then
+    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
         yellow "\n正在启动 caddy 服务\n"
         launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
         launchctl load -w "${launchd_dir}/com.caddy.service.plist"
@@ -602,7 +666,7 @@ start_caddy() {
 
 # 重启 caddy
 restart_caddy() {
-    if command -v caddy &>/dev/null; then
+    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
         yellow "\n正在重启 caddy 服务\n"
         launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
         sleep 1
@@ -634,8 +698,14 @@ uninstall_xray() {
 
             reading "\n是否卸载 caddy？(y/n): " choice
             case "${choice}" in
-                y|Y) brew uninstall caddy 2>/dev/null ;;
+                y|Y) rm -f /usr/local/bin/caddy; green "caddy 已卸载" ;;
                 *) yellow "取消卸载 caddy\n" ;;
+            esac
+
+            reading "\n是否卸载 jq？(y/n): " choice
+            case "${choice}" in
+                y|Y) rm -f /usr/local/bin/jq; green "jq 已卸载" ;;
+                *) yellow "取消卸载 jq\n" ;;
             esac
 
             # 删除工作目录
@@ -649,21 +719,15 @@ uninstall_xray() {
     esac
 }
 
-# 创建快捷指令 - macOS 使用 /usr/local/bin
+# 创建快捷指令
 create_shortcut() {
     cat > "${work_dir}/2go.sh" << 'EOF'
 #!/usr/bin/env bash
 bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) $1
 EOF
     chmod +x "${work_dir}/2go.sh"
-    # macOS 上 /usr/local/bin 不需要 sudo（如果目录存在）
-    if [ -d /usr/local/bin ]; then
-        ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go 2>/dev/null || \
-        sudo ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go
-    else
-        sudo mkdir -p /usr/local/bin
-        sudo ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go
-    fi
+    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
+    ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go
     if [ -f /usr/local/bin/2go ]; then
         green "\n快捷指令 2go 创建成功\n"
     else
@@ -690,7 +754,6 @@ change_config() {
         1)
             reading "\n请输入新的UUID: " new_uuid
             [ -z "$new_uuid" ] && new_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]') && green "\n生成的UUID为：$new_uuid"
-            # macOS sed -i 需要备份后缀，用 '' 表示不保留备份
             sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$config_dir"
             restart_xray
             sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$client_dir"
@@ -701,14 +764,14 @@ change_config() {
                 encoded_vmess="${vmess_url#"$vmess_prefix"}"
                 decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
                 updated_vmess=$(echo "$decoded_vmess" | jq --arg new_uuid "$new_uuid" '.id = $new_uuid')
-                encoded_updated_vmess=$(echo "$updated_vmess" | base64)
-                encoded_updated_vmess=$(echo "$encoded_updated_vmess" | tr -d '\n')
+                encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
                 new_vmess_url="$vmess_prefix$encoded_updated_vmess"
                 content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
             done
             echo "$content" > "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub.txt"
-            tr -d '\n' < "${work_dir}/sub.txt" > "${work_dir}/sub_tmp.txt" && mv "${work_dir}/sub_tmp.txt" "${work_dir}/sub.txt"
+            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
+            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
+            rm -f "${work_dir}/sub_tmp.txt"
             while IFS= read -r line; do yellow "$line"; done < "$client_dir"
             green "\nUUID已修改为：${purple}${new_uuid}${re} ${green}请更新订阅或手动更改所有节点的UUID${re}\n"
             ;;
@@ -723,8 +786,9 @@ change_config() {
             sed -i '' "41s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
             restart_xray
             sed -i '' '1s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub.txt"
-            tr -d '\n' < "${work_dir}/sub.txt" > "${work_dir}/sub_tmp.txt" && mv "${work_dir}/sub_tmp.txt" "${work_dir}/sub.txt"
+            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
+            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
+            rm -f "${work_dir}/sub_tmp.txt"
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nGRPC-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改grpc-reality节点端口${re}\n"
             ;;
@@ -739,8 +803,9 @@ change_config() {
             sed -i '' "35s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
             restart_xray
             sed -i '' '3s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub.txt"
-            tr -d '\n' < "${work_dir}/sub.txt" > "${work_dir}/sub_tmp.txt" && mv "${work_dir}/sub_tmp.txt" "${work_dir}/sub.txt"
+            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
+            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
+            rm -f "${work_dir}/sub_tmp.txt"
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\nxhttp-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改xhttp-reality节点端口${re}\n"
             ;;
@@ -763,8 +828,9 @@ change_config() {
             restart_xray
             sed -i '' "1s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" "$client_dir"
             sed -i '' "1s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*authority=\)[^&]*/\1$new_sni/" "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub.txt"
-            tr -d '\n' < "${work_dir}/sub.txt" > "${work_dir}/sub_tmp.txt" && mv "${work_dir}/sub_tmp.txt" "${work_dir}/sub.txt"
+            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
+            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
+            rm -f "${work_dir}/sub_tmp.txt"
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             echo ""
             green "\nReality sni已修改为：${purple}${new_sni}${re} ${green}请更新订阅或手动更改reality节点的sni域名${re}\n"
@@ -791,7 +857,7 @@ disable_open_sub() {
         reading "请输入选择: " choice
         case "${choice}" in
             1)
-                if command -v caddy &>/dev/null; then
+                if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
                     launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
                     green "\n已关闭节点订阅\n"
                 else
@@ -805,7 +871,7 @@ disable_open_sub() {
                 sed -i '' "s/\/[a-zA-Z0-9]\{1,\}/\/$password/g" "${work_dir}/Caddyfile"
                 sub_port=$(grep -oE ':[0-9]+' "${work_dir}/Caddyfile" | head -1 | tr -d ':')
                 start_caddy
-                if [ "$sub_port" -eq 80 ] 2>/dev/null; then
+                if [ "$sub_port" = "80" ]; then
                     link="http://$server_ip/$password"
                 else
                     green "订阅端口：$sub_port"
@@ -857,6 +923,59 @@ manage_xray() {
     esac
 }
 
+# 获取 argo 临时隧道
+get_quick_tunnel() {
+    restart_argo
+    yellow "获取临时 argo 域名中，请稍等...\n"
+    sleep 5
+    if [ -f "${work_dir}/argo.log" ]; then
+        for i in {1..8}; do
+            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+            [ -n "$get_argodomain" ] && break
+            sleep 3
+        done
+    else
+        restart_argo
+        sleep 8
+        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
+    fi
+    if [ -n "$get_argodomain" ]; then
+        green "ArgoDomain：${purple}$get_argodomain${re}\n"
+    else
+        red "获取 Argo 域名失败，请检查网络后重试\n"
+    fi
+    ArgoDomain=$get_argodomain
+}
+
+# 更新 Argo 域名到订阅
+change_argo_domain() {
+    if [ -z "$ArgoDomain" ]; then
+        red "Argo 域名为空，无法更新"
+        return
+    fi
+    sed -i '' "5s/sni=[^&]*/sni=$ArgoDomain/" "${work_dir}/url.txt"
+    sed -i '' "5s/host=[^&]*/host=$ArgoDomain/" "${work_dir}/url.txt"
+    content=$(cat "$client_dir")
+    vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
+    vmess_prefix="vmess://"
+    for vmess_url in $vmess_urls; do
+        encoded_vmess="${vmess_url#"$vmess_prefix"}"
+        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
+        updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
+        encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
+        new_vmess_url="$vmess_prefix$encoded_updated_vmess"
+        content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+    done
+    echo "$content" > "$client_dir"
+    base64 -i "${work_dir}/url.txt" -o "${work_dir}/sub_tmp.txt"
+    tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
+    rm -f "${work_dir}/sub_tmp.txt"
+
+    while IFS= read -r line; do echo -e "${purple}$line"; done < "$client_dir"
+
+    green "\n节点已更新，更新订阅或手动复制以上节点\n"
+}
+
 # Argo 管理
 manage_argo() {
     check_argo &>/dev/null
@@ -905,7 +1024,6 @@ ingress:
       noTLSVerify: true
   - service: http_status:404
 EOF
-                # 更新 launchd plist 为固定隧道
                 cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << PEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -982,61 +1100,17 @@ PEOF
             change_argo_domain
             ;;
         5)
-            # 检查是否为临时隧道
-            if grep -q "localhost:${ARGO_PORT}" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null && ! grep -q "tunnel.yml" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null; then
-                get_quick_tunnel
-                change_argo_domain
-            else
+            if grep -q "tunnel.yml" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null || grep -q "\-\-token" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null; then
                 yellow "当前使用固定隧道，无法获取临时隧道"
                 sleep 2
+            else
+                get_quick_tunnel
+                change_argo_domain
             fi
             ;;
         6) menu ;;
         *) red "无效的选项！" ;;
     esac
-}
-
-# 获取 argo 临时隧道
-get_quick_tunnel() {
-    restart_argo
-    yellow "获取临时 argo 域名中，请稍等...\n"
-    sleep 3
-    if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..5}; do
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-            [ -n "$get_argodomain" ] && break
-            sleep 2
-        done
-    else
-        restart_argo
-        sleep 6
-        get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log")
-    fi
-    green "ArgoDomain：${purple}$get_argodomain${re}\n"
-    ArgoDomain=$get_argodomain
-}
-
-# 更新 Argo 域名到订阅
-change_argo_domain() {
-    sed -i '' "5s/sni=[^&]*/sni=$ArgoDomain/; 5s/host=[^&]*/host=$ArgoDomain/" "${work_dir}/url.txt"
-    content=$(cat "$client_dir")
-    vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    vmess_prefix="vmess://"
-    for vmess_url in $vmess_urls; do
-        encoded_vmess="${vmess_url#"$vmess_prefix"}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-        updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
-        encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-        new_vmess_url="$vmess_prefix$encoded_updated_vmess"
-        content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    done
-    echo "$content" > "$client_dir"
-    base64 -i "${work_dir}/url.txt" -o "${work_dir}/sub.txt"
-    tr -d '\n' < "${work_dir}/sub.txt" > "${work_dir}/sub_tmp.txt" && mv "${work_dir}/sub_tmp.txt" "${work_dir}/sub.txt"
-
-    while IFS= read -r line; do echo -e "${purple}$line"; done < "$client_dir"
-
-    green "\n节点已更新，更新订阅或手动复制以上节点\n"
 }
 
 # 查看节点信息和订阅链接
@@ -1046,9 +1120,13 @@ check_nodes() {
     if [ $xray_status -eq 0 ]; then
         while IFS= read -r line; do purple "$line"; done < ${work_dir}/url.txt
         server_ip=$(get_realip)
-        sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" | head -1)
-        lujing=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile")
-        green "\n\n节点订阅链接：http://$server_ip:$sub_port/$lujing\n"
+        sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
+        lujing=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
+        if [ -n "$sub_port" ] && [ -n "$lujing" ]; then
+            green "\n\n节点订阅链接：http://$server_ip:$sub_port/$lujing\n"
+        else
+            yellow "\n\n订阅信息获取失败，请检查 Caddy 配置\n"
+        fi
     else
         yellow "Xray-2go 尚未安装或未运行，请先安装或启动 Xray-2go"
         sleep 1
@@ -1092,9 +1170,8 @@ menu() {
                 if [ $check_xray_ret -eq 0 ]; then
                     yellow "Xray-2go 已经安装！"
                 else
-                    check_homebrew
                     install_caddy
-                    manage_packages install jq unzip coreutils qrencode
+                    manage_packages install jq qrencode
                     install_xray
                     macos_launchd_services
                     sleep 3
