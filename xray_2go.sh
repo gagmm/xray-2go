@@ -172,19 +172,47 @@ QREOF
 
 # 获取真实 IP
 get_realip() {
-    ip=$(curl -s --max-time 2 ipv4.ip.sb)
-    if [ -z "$ip" ]; then
-        ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-        echo "[$ipv6]"
-    else
-        if echo "$(curl -s http://ipinfo.io/org)" | grep -qE 'Cloudflare|UnReal|AEZA|Andrei'; then
-            ipv6=$(curl -s --max-time 2 ipv6.ip.sb)
-            echo "[$ipv6]"
-        else
+    local apis=(
+        "ifconfig.me"
+        "api.ipify.org"
+        "icanhazip.com"
+        "ipecho.net/plain"
+        "checkip.amazonaws.com"
+        "ipv4.ip.sb"
+    )
+    
+    local ip=""
+    for api in "${apis[@]}"; do
+        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "$ip"
+            return
         fi
+    done
+
+    # IPv4 全部失败，尝试 IPv6
+    local ipv6_apis=(
+        "api64.ipify.org"
+        "ipv6.ip.sb"
+    )
+    for api in "${ipv6_apis[@]}"; do
+        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        if [ -n "$ip" ]; then
+            echo "[$ip]"
+            return
+        fi
+    done
+
+    # 全部失败，手动输入
+    red "无法自动获取公网 IP"
+    reading "请手动输入你的服务器公网 IP: " manual_ip
+    if [ -n "$manual_ip" ]; then
+        echo "$manual_ip"
+    else
+        echo "127.0.0.1"
     fi
 }
+
 
 # 安装 caddy - 直接下载二进制
 install_caddy() {
