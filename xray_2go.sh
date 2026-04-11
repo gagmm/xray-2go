@@ -28,7 +28,7 @@ work_dir="$HOME/.xray"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 launchd_dir="$HOME/Library/LaunchAgents"
-export_dir="$HOME/Desktop"
+export_dir="$(pwd)"
 
 # 自动查找可用端口
 find_available_port() {
