@@ -535,37 +535,58 @@ function Install-Services {
 function Install-CaddyService {
     Load-Ports
 
-    $caddyConfig = @"
-{
-    auto_https off
-}
+    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
+    $workDirForward = $WorkDir -replace '\\','/'
 
-:$($script:PORT) {
-    handle /$($script:password) {
-        root * $($WorkDir -replace '\\','/')
-        try_files /sub.txt
-        file_server browse
-        header Content-Type "text/plain; charset=utf-8"
-    }
+    $caddyLines = @()
+    $caddyLines += '{'
+    $caddyLines += '    auto_https off'
+    $caddyLines += '}'
+    $caddyLines += ''
+    $caddyLines += ":$($script:PORT) {"
+    $caddyLines += "    handle /$($script:password) {"
+    $caddyLines += "        root * $workDirForward"
+    $caddyLines += '        try_files /sub.txt'
+    $caddyLines += '        file_server browse'
+    $caddyLines += '        header Content-Type "text/plain; charset=utf-8"'
+    $caddyLines += '    }'
+    $caddyLines += ''
+    $caddyLines += '    handle {'
+    $caddyLines += '        respond "404 Not Found" 404'
+    $caddyLines += '    }'
+    $caddyLines += '}'
 
-    handle {
-        respond "404 Not Found" 404
-    }
-}
-"@
-    $caddyConfig | Out-File -FilePath "$WorkDir\Caddyfile" -Encoding UTF8
+    $caddyLines -join "`r`n" | Out-File -FilePath $caddyFilePath -Encoding UTF8
 
     & $NssmPath stop caddy 2>$null
     & $NssmPath remove caddy confirm 2>$null
-    & $NssmPath install caddy "$WorkDir\caddy.exe" "run --config `"$WorkDir\Caddyfile`""
-    & $NssmPath set caddy AppDirectory "$WorkDir"
+    $caddyArgs = "run --config `"$caddyFilePath`""
+    $caddyExe = Join-Path $WorkDir 'caddy.exe'
+    & $NssmPath install caddy $caddyExe $caddyArgs
+    & $NssmPath set caddy AppDirectory $WorkDir
     & $NssmPath set caddy DisplayName 'Caddy Web Server'
     & $NssmPath set caddy Start SERVICE_AUTO_START
-    & $NssmPath set caddy AppStdout "$WorkDir\caddy_out.log"
-    & $NssmPath set caddy AppStderr "$WorkDir\caddy_error.log"
+    $caddyOut = Join-Path $WorkDir 'caddy_out.log'
+    $caddyErr = Join-Path $WorkDir 'caddy_error.log'
+    & $NssmPath set caddy AppStdout $caddyOut
+    & $NssmPath set caddy AppStderr $caddyErr
     & $NssmPath start caddy
-    Write-Green 'Caddy 服务已启动'
+    Write-Green 'Caddy started'
 }
+
+function Get-CaddyInfo {
+    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
+    $result = @{ Port = $script:PORT; Path = $script:password }
+    if (Test-Path $caddyFilePath) {
+        $cc = Get-Content $caddyFilePath -Raw
+        $portPattern = ':(\d+)\s*\{'
+        $pathPattern = 'handle /(\w+)'
+        if ($cc -match $portPattern) { $result.Port = $matches[1] }
+        if ($cc -match $pathPattern) { $result.Path = $matches[1] }
+    }
+    return $result
+}
+
 
 # ==========================================
 # 获取信息并生成节点
@@ -651,7 +672,7 @@ function Export-ProxyTxt {
     Load-Ports
 
     if (-not (Test-Path $ClientDir)) {
-        Write-Red '节点文件不存在，请先安装 Xray-2go'
+        Write-Red 'No node file found'
         return
     }
 
@@ -660,84 +681,87 @@ function Export-ProxyTxt {
     $exportFile = Join-Path $TargetDir "xray2go_proxy_${timestamp}.txt"
     $exportFileLatest = Join-Path $TargetDir 'xray2go_proxy_latest.txt'
 
-    $argodomain = Get-ArgoDomain -LogFile "$WorkDir\argo.log"
+    $argoLog = Join-Path $WorkDir 'argo.log'
+    $argodomain = Get-ArgoDomain -LogFile $argoLog
 
-    $subPort = $script:PORT
-    $subPath = $script:password
-    $caddyFile = "$WorkDir\Caddyfile"
-    if (Test-Path $caddyFile) {
-        $cc = Get-Content $caddyFile -Raw
-        if ($cc -match ':(\d+)\s*\{') { $subPort = $matches[1] }
-        if ($cc -match 'handle\s+/(\w+)') { $subPath = $matches[1] }
-    }
+    $info = Get-CaddyInfo
+    $subPort = $info.Port
+    $subPath = $info.Path
 
     $urlContent = Get-Content $ClientDir -ErrorAction SilentlyContinue
-    $lineGrpc  = ($urlContent | Where-Object { $_ -match 'grpc' }  | Select-Object -First 1)
-    $lineXhttp = ($urlContent | Where-Object { $_ -match 'xhttp' } | Select-Object -First 1)
-    $lineWs    = ($urlContent | Where-Object { $_ -match 'vless.*ws' } | Select-Object -First 1)
-    $lineVmess = ($urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1)
+    $lineGrpc  = $urlContent | Where-Object { $_ -match 'grpc' }  | Select-Object -First 1
+    $lineXhttp = $urlContent | Where-Object { $_ -match 'xhttp' } | Select-Object -First 1
+    $lineWs    = $urlContent | Where-Object { ($_ -match 'vless') -and ($_ -match 'ws') } | Select-Object -First 1
+    $lineVmess = $urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1
 
-    $detailedContent = @"
-============================================
-  Xray-2go Proxy Info (Windows)
-  Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-  Server: ${IP}
-============================================
+    $adStr = if ($argodomain) { $argodomain } else { 'N/A' }
+    $subLink = "http://${IP}:${subPort}/${subPath}"
 
-PORT:       ${subPort}
-ARGO_PORT:  $($script:ARGO_PORT)
-GRPC_PORT:  $($script:GRPC_PORT)
-XHTTP_PORT: $($script:XHTTP_PORT)
+    $lines = @()
+    $lines += '============================================'
+    $lines += '  Xray-2go Proxy Info (Windows)'
+    $lines += "  Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+    $lines += "  Server: ${IP}"
+    $lines += '============================================'
+    $lines += ''
+    $lines += "PORT:       ${subPort}"
+    $lines += "ARGO_PORT:  $($script:ARGO_PORT)"
+    $lines += "GRPC_PORT:  $($script:GRPC_PORT)"
+    $lines += "XHTTP_PORT: $($script:XHTTP_PORT)"
+    $lines += ''
+    $lines += "UUID: $($script:UUID)"
+    $lines += "Argo Domain: $adStr"
+    $lines += ''
+    $lines += '============================================'
+    $lines += '  Node Links'
+    $lines += '============================================'
+    $lines += ''
+    $lines += '--- VLESS GRPC Reality ---'
+    $lines += $lineGrpc
+    $lines += ''
+    $lines += '--- VLESS XHTTP Reality ---'
+    $lines += $lineXhttp
+    $lines += ''
+    $lines += '--- VLESS WS (Argo) ---'
+    $lines += $lineWs
+    $lines += ''
+    $lines += '--- VMess WS (Argo) ---'
+    $lines += $lineVmess
+    $lines += ''
+    $lines += '============================================'
+    $lines += '  Subscribe'
+    $lines += '============================================'
+    $lines += ''
+    $lines += $subLink
+    $lines += ''
+    $lines += '============================================'
 
-UUID: $($script:UUID)
-
-Argo Domain: $(if ($argodomain) { $argodomain } else { 'N/A' })
-
-============================================
-  Node Links
-============================================
-
---- VLESS GRPC Reality ---
-$lineGrpc
-
---- VLESS XHTTP Reality ---
-$lineXhttp
-
---- VLESS WS (Argo) ---
-$lineWs
-
---- VMess WS (Argo) ---
-$lineVmess
-
-============================================
-  Subscribe
-============================================
-
-http://${IP}:${subPort}/${subPath}
-
-============================================
-"@
-    $detailedContent | Out-File -FilePath $exportFile -Encoding UTF8
+    $lines -join "`r`n" | Out-File -FilePath $exportFile -Encoding UTF8
     Copy-Item $exportFile $exportFileLatest -Force
 
     $linksFile = Join-Path $TargetDir "xray2go_links_${timestamp}.txt"
     $linksFileLatest = Join-Path $TargetDir 'xray2go_links_latest.txt'
     $nonEmpty = $urlContent | Where-Object { $_.Trim() -ne '' }
-    $linksOut = ($nonEmpty -join "`r`n") + "`r`n`r`n# Subscribe`r`nhttp://${IP}:${subPort}/${subPath}"
-    $linksOut | Out-File -FilePath $linksFile -Encoding UTF8
+    $linksLines = @()
+    $linksLines += $nonEmpty
+    $linksLines += ''
+    $linksLines += '# Subscribe'
+    $linksLines += $subLink
+    $linksLines -join "`r`n" | Out-File -FilePath $linksFile -Encoding UTF8
     Copy-Item $linksFile $linksFileLatest -Force
 
     if ($Mode -eq 'auto') {
-        Write-Green "`n代理信息已自动导出："
+        Write-Green 'Proxy info exported (auto):'
     }
     else {
-        Write-Green "`n代理信息已导出："
+        Write-Green 'Proxy info exported:'
     }
-    Write-Green "  详细版: $exportFile"
-    Write-Green "  详细版(latest): $exportFileLatest"
-    Write-Green "  纯链接: $linksFile"
-    Write-Green "  纯链接(latest): $linksFileLatest`n"
+    Write-Green "  Detail: $exportFile"
+    Write-Green "  Detail(latest): $exportFileLatest"
+    Write-Green "  Links: $linksFile"
+    Write-Green "  Links(latest): $linksFileLatest"
 }
+
 
 # ==========================================
 # 服务管理
@@ -915,20 +939,15 @@ function Show-Nodes {
         Load-Ports
         Write-Host ''
         Get-Content $ClientDir | ForEach-Object { Write-Purple $_ }
-
         $serverIp = Get-RealIP
-        $subPort = $script:PORT
-        $subPath = $script:password
-        $cf = "$WorkDir\Caddyfile"
-        if (Test-Path $cf) {
-            $cc = Get-Content $cf -Raw
-            if ($cc -match ':(\d+)\s*\{') { $subPort = $matches[1] }
-            if ($cc -match 'handle\s+/(\w+)') { $subPath = $matches[1] }
-        }
-        Write-Green "`n订阅链接：http://${serverIp}:${subPort}/${subPath}`n"
+        $info = Get-CaddyInfo
+        $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
+        Write-Host ''
+        Write-Green "Subscribe: $subLink"
+        Write-Host ''
     }
     else {
-        Write-Yellow 'Xray-2go 尚未安装或未运行'
+        Write-Yellow 'Xray-2go not installed or not running'
     }
 }
 
@@ -998,52 +1017,58 @@ function Change-Config {
 function Manage-Subscription {
     $s = Check-Xray
     if ($s -ne 0) {
-        Write-Yellow 'Xray-2go 尚未安装或未运行'
+        Write-Yellow 'Xray-2go not installed or not running'
         return
     }
+    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
     Clear-Host
     Write-Host ''
-    Write-Green '1. 关闭节点订阅'
-    Write-Green '2. 开启节点订阅'
-    Write-Green '3. 更换订阅端口'
-    Write-Purple '4. 返回主菜单'
+    Write-Green '1. Stop subscription'
+    Write-Green '2. Start subscription (new password)'
+    Write-Green '3. Change subscription port'
+    Write-Purple '4. Back'
 
-    $choice = Read-Host '请输入选择'
+    $choice = Read-Host 'Select'
     switch ($choice) {
         '1' {
             & $NssmPath stop caddy 2>$null
-            Write-Green '已关闭节点订阅'
+            Write-Green 'Subscription stopped'
         }
         '2' {
             $newPw = New-Password -Length 32
-            $cc = Get-Content "$WorkDir\Caddyfile" -Raw
-            $cc = $cc -replace 'handle\s+/\w+', "handle /$newPw"
-            $cc | Out-File "$WorkDir\Caddyfile" -Encoding UTF8
+            if (Test-Path $caddyFilePath) {
+                $cc = Get-Content $caddyFilePath -Raw
+                $cc = $cc -replace 'handle /\w+', "handle /$newPw"
+                $cc | Out-File -FilePath $caddyFilePath -Encoding UTF8
+            }
             Restart-CaddySvc
             $serverIp = Get-RealIP
-            $sp = $script:PORT
-            if ($cc -match ':(\d+)\s*\{') { $sp = $matches[1] }
-            Write-Green "新订阅链接：http://${serverIp}:${sp}/${newPw}"
+            $info = Get-CaddyInfo
+            $subLink = "http://${serverIp}:$($info.Port)/$newPw"
+            Write-Green "New subscribe link: $subLink"
         }
         '3' {
-            $newPort = Read-Host '请输入新的订阅端口(1-65535)'
+            $newPort = Read-Host 'New port (1-65535, Enter=auto)'
             if (-not $newPort) { $newPort = Find-AvailablePort -StartPort 2000 -EndPort 65000 }
-            $cc = Get-Content "$WorkDir\Caddyfile" -Raw
-            $cc = $cc -replace ':\d+\s*\{', ":$newPort {"
-            $cc | Out-File "$WorkDir\Caddyfile" -Encoding UTF8
-            $pe = (Get-Content $PortsEnvFile) -replace 'PORT=.*', "PORT=$newPort"
-            $pe | Out-File $PortsEnvFile -Encoding UTF8
+            if (Test-Path $caddyFilePath) {
+                $cc = Get-Content $caddyFilePath -Raw
+                $cc = $cc -replace ':\d+\s*\{', ":$newPort {"
+                $cc | Out-File -FilePath $caddyFilePath -Encoding UTF8
+            }
+            if (Test-Path $PortsEnvFile) {
+                $pe = (Get-Content $PortsEnvFile) -replace 'PORT=.*', "PORT=$newPort"
+                $pe | Out-File -FilePath $PortsEnvFile -Encoding UTF8
+            }
             Restart-CaddySvc
             $serverIp = Get-RealIP
-            $path = $script:password
-            if ($cc -match 'handle\s+/(\w+)') { $path = $matches[1] }
-            Write-Green "新订阅链接：http://${serverIp}:${newPort}/${path}"
+            $info = Get-CaddyInfo
+            $subLink = "http://${serverIp}:${newPort}/$($info.Path)"
+            Write-Green "New subscribe link: $subLink"
         }
         '4' { return }
-        default { Write-Red '无效选项' }
+        default { Write-Red 'Invalid' }
     }
 }
-
 # ==========================================
 # Xray 管理菜单
 # ==========================================
@@ -1134,23 +1159,23 @@ function Manage-ArgoMenu {
 function Show-ExportMenu {
     $s = Check-Xray
     if (($s -ne 0) -and (-not (Test-Path $ClientDir))) {
-        Write-Yellow 'Xray-2go 尚未安装，无节点可导出'
+        Write-Yellow 'Xray-2go not installed'
         return
     }
 
     Clear-Host
     Write-Host ''
-    Write-Green '1. 导出到当前目录'
-    Write-Green '2. 导出到自定义路径'
-    Write-Green '3. 在终端显示所有节点链接'
-    Write-Green '4. 复制订阅链接到剪贴板'
-    Write-Purple '5. 返回主菜单'
+    Write-Green '1. Export to current directory'
+    Write-Green '2. Export to custom path'
+    Write-Green '3. Show all node links'
+    Write-Green '4. Copy subscribe link to clipboard'
+    Write-Purple '5. Back'
 
-    $choice = Read-Host '请输入选择'
+    $choice = Read-Host 'Select'
     switch ($choice) {
         '1' { Export-ProxyTxt -Mode 'manual' }
         '2' {
-            $customPath = Read-Host '请输入导出路径'
+            $customPath = Read-Host 'Export path'
             if (-not $customPath) { $customPath = $ExportDir }
             if (-not (Test-Path $customPath)) {
                 New-Item -ItemType Directory -Path $customPath -Force | Out-Null
@@ -1160,41 +1185,29 @@ function Show-ExportMenu {
         '3' {
             Load-Ports
             Write-Host ''
-            Write-Green '========== 所有节点链接 =========='
+            Write-Green '========== Node Links =========='
             Get-Content $ClientDir | Where-Object { $_.Trim() -ne '' } | ForEach-Object { Write-Purple $_ }
             $serverIp = Get-RealIP
-            $subPort = $script:PORT
-            $subPath = $script:password
-            $cf = "$WorkDir\Caddyfile"
-            if (Test-Path $cf) {
-                $cc = Get-Content $cf -Raw
-                if ($cc -match ':(\d+)\s*\{') { $subPort = $matches[1] }
-                if ($cc -match 'handle\s+/(\w+)') { $subPath = $matches[1] }
-            }
+            $info = Get-CaddyInfo
+            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
             Write-Host ''
-            Write-Green '========== 订阅链接 =========='
-            Write-Green "http://${serverIp}:${subPort}/${subPath}"
+            Write-Green '========== Subscribe =========='
+            Write-Green $subLink
             Write-Green '================================'
         }
         '4' {
             Load-Ports
             $serverIp = Get-RealIP
-            $subPort = $script:PORT
-            $subPath = $script:password
-            $cf = "$WorkDir\Caddyfile"
-            if (Test-Path $cf) {
-                $cc = Get-Content $cf -Raw
-                if ($cc -match ':(\d+)\s*\{') { $subPort = $matches[1] }
-                if ($cc -match 'handle\s+/(\w+)') { $subPath = $matches[1] }
-            }
-            $subLink = "http://${serverIp}:${subPort}/${subPath}"
+            $info = Get-CaddyInfo
+            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
             Set-Clipboard -Value $subLink
-            Write-Green "订阅链接已复制到剪贴板：$subLink"
+            Write-Green "Copied: $subLink"
         }
         '5' { return }
-        default { Write-Red '无效选项' }
+        default { Write-Red 'Invalid' }
     }
 }
+
 
 # ==========================================
 # 主菜单
