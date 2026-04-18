@@ -1103,7 +1103,7 @@ EOF
     else
         for profile in "${HOME}/.bashrc" "${HOME}/.zshrc" "${HOME}/.profile"; do
             [[ -f "$profile" ]] && ! grep -q "xray2go-check" "$profile" && \
-                echo -e "\n# xray2go-check\n(pgrep -f \"${INSTALL_DIR}/xray\" >/dev/null 2>&1 || ${INSTALL_DIR}/xray-boot.sh &) >/dev/null 2>&1 &" >> "$profile"
+                echo -e "\n# xray2go-check\n(pgrep -f \"${INSTALL_DIR}/xray\" >/dev/null 2>&1 || ${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1 &) >/dev/null 2>&1" >> "$profile"
         done
 
         # XDG autostart
