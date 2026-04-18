@@ -1,1286 +1,1541 @@
-# ===========================================
-# Xray-2go Windows PowerShell 版
-# 自动端口选择、多API获取IP、导出代理为txt
-# 需要以管理员身份运行
-# ===========================================
+# ============================================================
+# Xray-2go Windows 完整脚本
+# 支持: Windows 10/11 (x64 / arm64)
+# 权限: 纯用户权限，无需管理员
+# 运行: powershell -ExecutionPolicy Bypass -File xray2go.ps1
+# 版本: 2.0
+# ============================================================
 
-#Requires -RunAsAdministrator
+#Requires -Version 5.1
 
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-# 定义常量
-$ServerName = 'xray'
-$WorkDir = "$env:USERPROFILE\.xray"
-$ConfigDir = "$WorkDir\config.json"
-$ClientDir = "$WorkDir\url.txt"
-$ExportDir = (Get-Location).Path
-$PortsEnvFile = "$WorkDir\ports.env"
-$NssmPath = "$WorkDir\nssm.exe"
-$CFIP = 'cdns.doon.eu.org'
-$CFPORT = '443'
+# ============================================================
+# 全局变量
+# ============================================================
+$SCRIPT_VERSION  = "2.0"
+$INSTALL_DIR     = Join-Path $env:APPDATA "xray2go"
+$LOG_DIR         = Join-Path $INSTALL_DIR "logs"
+$CDN_HOST        = "cdns.doon.eu.org"
+$PORTS_ENV       = Join-Path $INSTALL_DIR "ports.env"
+$DOT_ENV         = Join-Path $INSTALL_DIR ".env"
 
-# ==========================================
-# 颜色输出
-# ==========================================
-function Write-Red { param([string]$Text); Write-Host $Text -ForegroundColor Red }
-function Write-Green { param([string]$Text); Write-Host $Text -ForegroundColor Green }
-function Write-Yellow { param([string]$Text); Write-Host $Text -ForegroundColor Yellow }
-function Write-Purple { param([string]$Text); Write-Host $Text -ForegroundColor Magenta }
-function Write-SkyBlue { param([string]$Text); Write-Host $Text -ForegroundColor Cyan }
+# 颜色别名
+function Write-Info  { param([string]$m) Write-Host "$(Get-Timestamp) [INFO]  $m" -ForegroundColor Green }
+function Write-Warn  { param([string]$m) Write-Host "$(Get-Timestamp) [WARN]  $m" -ForegroundColor Yellow }
+function Write-Err   { param([string]$m) Write-Host "$(Get-Timestamp) [ERROR] $m" -ForegroundColor Red }
+function Write-Step  { param([string]$m) Write-Host "$(Get-Timestamp) [STEP]  ===== $m =====" -ForegroundColor Cyan }
+function Get-Timestamp { Get-Date -Format "yyyy-MM-dd HH:mm:ss" }
 
-# ==========================================
-# 工具函数
-# ==========================================
-function Find-AvailablePort {
-    param(
-        [int]$StartPort = 1000,
-        [int]$EndPort = 60000
-    )
-    for ($i = 0; $i -lt 50; $i++) {
-        $port = Get-Random -Minimum $StartPort -Maximum $EndPort
-        $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
-        if (-not $listener) {
-            return $port
-        }
-    }
-    return (Get-Random -Minimum $StartPort -Maximum $EndPort)
+function Die {
+    param([string]$Message)
+    Write-Err $Message
+    exit 1
 }
 
-function Assign-Ports {
-    Write-Yellow '正在自动分配可用端口...'
-
-    $script:PORT = Find-AvailablePort -StartPort 1000 -EndPort 60000
-    $script:ARGO_PORT = Find-AvailablePort -StartPort 8000 -EndPort 9000
-    while ($script:ARGO_PORT -eq $script:PORT) {
-        $script:ARGO_PORT = Find-AvailablePort -StartPort 8000 -EndPort 9000
-    }
-    $script:GRPC_PORT = Find-AvailablePort -StartPort 10000 -EndPort 30000
-    while (($script:GRPC_PORT -eq $script:PORT) -or ($script:GRPC_PORT -eq $script:ARGO_PORT)) {
-        $script:GRPC_PORT = Find-AvailablePort -StartPort 10000 -EndPort 30000
-    }
-    $script:XHTTP_PORT = Find-AvailablePort -StartPort 30001 -EndPort 50000
-    while (($script:XHTTP_PORT -eq $script:PORT) -or ($script:XHTTP_PORT -eq $script:ARGO_PORT) -or ($script:XHTTP_PORT -eq $script:GRPC_PORT)) {
-        $script:XHTTP_PORT = Find-AvailablePort -StartPort 30001 -EndPort 50000
-    }
-
-    Write-Green '端口分配完成：'
-    Write-Green "  订阅端口 (PORT):       $($script:PORT)"
-    Write-Green "  Argo 端口 (ARGO_PORT): $($script:ARGO_PORT)"
-    Write-Green "  GRPC 端口:             $($script:GRPC_PORT)"
-    Write-Green "  XHTTP 端口:            $($script:XHTTP_PORT)"
-}
-
-function Save-Ports {
-    $content = @(
-        "PORT=$($script:PORT)",
-        "ARGO_PORT=$($script:ARGO_PORT)",
-        "GRPC_PORT=$($script:GRPC_PORT)",
-        "XHTTP_PORT=$($script:XHTTP_PORT)",
-        "password=$($script:password)",
-        "private_key=$($script:privateKey)",
-        "public_key=$($script:publicKey)",
-        "UUID=$($script:UUID)"
-    )
-    $content -join "`r`n" | Out-File -FilePath $PortsEnvFile -Encoding UTF8
-}
-
-function Load-Ports {
-    if (Test-Path $PortsEnvFile) {
-        $lines = Get-Content $PortsEnvFile
-        foreach ($line in $lines) {
-            if ($line -match '^([^=]+)=(.*)$') {
-                $varName = $matches[1].Trim()
-                $varValue = $matches[2].Trim()
-                Set-Variable -Name $varName -Value $varValue -Scope Script
-            }
-        }
-    }
-}
-
-function Get-RealIP {
-    [string[]]$apis = @(
-        'https://ifconfig.me',
-        'https://api.ipify.org',
-        'https://icanhazip.com',
-        'https://ipecho.net/plain',
-        'https://checkip.amazonaws.com',
-        'https://ipv4.ip.sb'
-    )
-
-    foreach ($api in $apis) {
-        try {
-            $response = Invoke-WebRequest -Uri $api -TimeoutSec 5 -UseBasicParsing
-            $ip = $response.Content.Trim()
-            if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
-                return $ip
-            }
-        }
-        catch {
-            continue
-        }
-    }
-
-    [string[]]$ipv6apis = @(
-        'https://api64.ipify.org',
-        'https://ipv6.ip.sb'
-    )
-    foreach ($api in $ipv6apis) {
-        try {
-            $response = Invoke-WebRequest -Uri $api -TimeoutSec 5 -UseBasicParsing
-            $ip = $response.Content.Trim()
-            if ($ip) { return "[$ip]" }
-        }
-        catch {
-            continue
-        }
-    }
-
-    Write-Red '无法自动获取公网 IP'
-    $manual = Read-Host '请手动输入你的服务器公网 IP'
-    if ($manual) { return $manual } else { return '127.0.0.1' }
-}
-
+# ============================================================
+# 平台检测
+# ============================================================
 function Get-Arch {
-    if ([Environment]::Is64BitOperatingSystem) {
-        $cpuArch = $env:PROCESSOR_ARCHITECTURE
-        if ($cpuArch -eq 'ARM64') {
-            return @{ ARCH = 'arm64'; ARCH_ARG = 'arm64-v8a' }
-        }
-        else {
-            return @{ ARCH = 'amd64'; ARCH_ARG = '64' }
-        }
-    }
-    else {
-        return @{ ARCH = '386'; ARCH_ARG = '32' }
+    $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture
+    switch ($arch) {
+        "X64"   { return "amd64" }
+        "Arm64" { return "arm64" }
+        default { Die "不支持的架构: $arch" }
     }
 }
 
-function New-UUID {
-    return [guid]::NewGuid().ToString()
+function Get-WinVersion {
+    $v = [System.Environment]::OSVersion.Version
+    return "$($v.Major).$($v.Minor).$($v.Build)"
 }
 
-function New-Password {
-    param([int]$Length = 24)
-    $chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
-    $result = ''
-    for ($i = 0; $i -lt $Length; $i++) {
-        $result += $chars[(Get-Random -Maximum $chars.Length)]
-    }
-    return $result
+function Test-IsAdmin {
+    $identity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]$identity
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function ConvertTo-Base64 {
-    param([string]$Text)
-    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
-    return [Convert]::ToBase64String($bytes)
-}
-
-function ConvertFrom-Base64 {
-    param([string]$Text)
-    $bytes = [Convert]::FromBase64String($Text)
-    return [System.Text.Encoding]::UTF8.GetString($bytes)
-}
-
-# ==========================================
-# 检查状态
-# ==========================================
-function Check-Xray {
-    if (Test-Path "$WorkDir\xray.exe") {
-        $svc = Get-Service -Name 'xray' -ErrorAction SilentlyContinue
-        if ($svc -and ($svc.Status -eq 'Running')) {
-            return 0
-        }
-        else {
-            return 1
+# ============================================================
+# 工具函数
+# ============================================================
+function Load-Env {
+    $env_table = @{}
+    if (Test-Path $PORTS_ENV) {
+        Get-Content $PORTS_ENV | ForEach-Object {
+            $line = $_.Trim()
+            if ($line -and -not $line.StartsWith('#') -and $line -match '^([^=]+)=(.*)$') {
+                $env_table[$Matches[1].Trim()] = $Matches[2].Trim()
+            }
         }
     }
-    return 2
+    return $env_table
 }
 
-function Check-Argo {
-    if (Test-Path "$WorkDir\argo.exe") {
-        $svc = Get-Service -Name 'cloudflared-tunnel' -ErrorAction SilentlyContinue
-        if ($svc -and ($svc.Status -eq 'Running')) {
-            return 0
-        }
-        else {
-            return 1
-        }
+function Save-Env {
+    param([hashtable]$EnvTable)
+    $lines = $EnvTable.GetEnumerator() | Sort-Object Key | ForEach-Object {
+        "$($_.Key)=$($_.Value)"
     }
-    return 2
+    $lines | Set-Content $PORTS_ENV -Encoding UTF8
 }
 
-function Check-Caddy {
-    if (Test-Path "$WorkDir\caddy.exe") {
-        $svc = Get-Service -Name 'caddy' -ErrorAction SilentlyContinue
-        if ($svc -and ($svc.Status -eq 'Running')) {
-            return 0
-        }
-        else {
-            return 1
-        }
+function Update-EnvKey {
+    param([string]$Key, [string]$Value)
+    $content = Get-Content $PORTS_ENV -Raw -Encoding UTF8
+    if ($content -match "(?m)^${Key}=.*$") {
+        $content = $content -replace "(?m)^${Key}=.*$", "${Key}=${Value}"
+    } else {
+        $content += "`n${Key}=${Value}"
     }
-    return 2
+    $content | Set-Content $PORTS_ENV -Encoding UTF8 -NoNewline
 }
 
-function Get-StatusText {
-    param([int]$Status)
-    switch ($Status) {
-        0 { return 'running' }
-        1 { return 'not running' }
-        2 { return 'not installed' }
+function Get-PublicIP {
+    $urls = @(
+        "https://api.ipify.org",
+        "https://ifconfig.me",
+        "https://ip.sb"
+    )
+    foreach ($url in $urls) {
+        try {
+            $resp = Invoke-WebRequest -Uri $url -UseBasicParsing `
+                -TimeoutSec 5 -ErrorAction Stop
+            return $resp.Content.Trim()
+        } catch { continue }
     }
+    return "unknown"
 }
 
-# ==========================================
-# 提取 Argo 域名
-# ==========================================
 function Get-ArgoDomain {
-    param([string]$LogFile)
-    if (-not (Test-Path $LogFile)) { return $null }
-    $content = Get-Content $LogFile -Raw -ErrorAction SilentlyContinue
-    if (-not $content) { return $null }
-    $pattern = 'https://([a-zA-Z0-9][a-zA-Z0-9-]*\.trycloudflare\.com)'
-    if ($content -match $pattern) {
-        return $matches[1]
+    param([hashtable]$Env)
+    if ($Env["CF_TUNNEL_DOMAIN"]) { return $Env["CF_TUNNEL_DOMAIN"] }
+    if ($Env["ARGO_DOMAIN"])      { return $Env["ARGO_DOMAIN"] }
+    if ($Env["CF_TUNNEL_ID"])     { return "$($Env['CF_TUNNEL_ID']).cfargotunnel.com" }
+
+    # 从日志提取
+    $logFile = Join-Path $LOG_DIR "argo.log"
+    if (Test-Path $logFile) {
+        $match = Select-String -Path $logFile `
+            -Pattern "([a-z0-9\-]+\.trycloudflare\.com)" |
+            Select-Object -Last 1
+        if ($match) {
+            return $match.Matches[0].Groups[1].Value
+        }
+    }
+    return ""
+}
+
+function Write-FileLog {
+    param([string]$LogFile, [string]$Message)
+    $timestamp = Get-Timestamp
+    $line = "[$timestamp] $Message"
+    # 日志轮转 2MB
+    if (Test-Path $LogFile) {
+        $size = (Get-Item $LogFile).Length
+        if ($size -gt 2MB) {
+            $tail = Get-Content $LogFile -Tail 200
+            $tail | Set-Content $LogFile -Encoding UTF8
+        }
+    }
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+}
+
+function Wait-Network {
+    Write-Info "等待网络就绪..."
+    for ($i = 1; $i -le 30; $i++) {
+        try {
+            $null = Test-Connection -ComputerName "1.1.1.1" -Count 1 -ErrorAction Stop
+            Write-Info "网络就绪 (第 ${i} 次)"
+            return
+        } catch {
+            Start-Sleep -Seconds 2
+        }
+    }
+    Write-Warn "网络等待超时，继续执行..."
+}
+
+# ============================================================
+# 端口生成
+# ============================================================
+function Get-RandomPort {
+    param([int[]]$Exclude = @())
+    $rng = [System.Random]::new()
+    while ($true) {
+        $port = $rng.Next(10000, 65001)
+        if ($port -notin $Exclude) { return $port }
+    }
+}
+
+function Generate-Ports {
+    Write-Step "生成随机端口"
+    $used = @()
+
+    $script:SUB_PORT    = Get-RandomPort -Exclude $used; $used += $script:SUB_PORT
+    $script:ARGO_PORT   = Get-RandomPort -Exclude $used; $used += $script:ARGO_PORT
+    $script:GRPC_PORT   = Get-RandomPort -Exclude $used; $used += $script:GRPC_PORT
+    $script:XHTTP_PORT  = Get-RandomPort -Exclude $used; $used += $script:XHTTP_PORT
+    $script:VISION_PORT = Get-RandomPort -Exclude $used; $used += $script:VISION_PORT
+    $script:SS_PORT     = Get-RandomPort -Exclude $used; $used += $script:SS_PORT
+    $script:H3_PORT     = Get-RandomPort -Exclude $used; $used += $script:H3_PORT
+
+    Write-Info "订阅:$($script:SUB_PORT) Argo:$($script:ARGO_PORT) GRPC:$($script:GRPC_PORT)"
+    Write-Info "XHTTP:$($script:XHTTP_PORT) Vision:$($script:VISION_PORT) SS:$($script:SS_PORT) H3:$($script:H3_PORT)"
+}
+
+# ============================================================
+# 密钥生成
+# ============================================================
+function Generate-Keys {
+    Write-Step "生成密钥"
+
+    # UUID
+    $script:UUID = [System.Guid]::NewGuid().ToString()
+
+    # x25519 密钥对
+    $xrayBin = Join-Path $INSTALL_DIR "xray.exe"
+    $output  = & $xrayBin x25519 2>&1
+    foreach ($line in $output) {
+        if ($line -match "Private key:\s*(.+)") {
+            $script:PRIVATE_KEY = $Matches[1].Trim()
+        }
+        if ($line -match "Public key:\s*(.+)") {
+            $script:PUBLIC_KEY = $Matches[1].Trim()
+        }
+    }
+
+    if (-not $script:PRIVATE_KEY) { Die "生成 x25519 密钥失败" }
+    if (-not $script:PUBLIC_KEY)  { Die "生成 x25519 公钥失败" }
+
+    # SS 密码 (16 字节 base64)
+    $ssBytes = New-Object byte[] 16
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($ssBytes)
+    $script:SS_PASSWORD = [Convert]::ToBase64String($ssBytes)
+
+    # Trojan 密码
+    $tBytes = New-Object byte[] 16
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($tBytes)
+    $script:TROJAN_PASSWORD = [BitConverter]::ToString($tBytes).Replace("-","").ToLower()
+
+    # 订阅 Token
+    $subBytes = New-Object byte[] 16
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($subBytes)
+    $script:SUB_TOKEN = [BitConverter]::ToString($subBytes).Replace("-","").ToLower()
+
+    Write-Info "UUID: $($script:UUID)"
+    Write-Info "PublicKey: $($script:PUBLIC_KEY)"
+}
+
+# ============================================================
+# 保存 ports.env
+# ============================================================
+function Save-PortsEnv {
+    @"
+SUB_PORT=$($script:SUB_PORT)
+ARGO_PORT=$($script:ARGO_PORT)
+GRPC_PORT=$($script:GRPC_PORT)
+XHTTP_PORT=$($script:XHTTP_PORT)
+VISION_PORT=$($script:VISION_PORT)
+SS_PORT=$($script:SS_PORT)
+XHTTP_H3_PORT=$($script:H3_PORT)
+UUID=$($script:UUID)
+private_key=$($script:PRIVATE_KEY)
+public_key=$($script:PUBLIC_KEY)
+ss_password=$($script:SS_PASSWORD)
+trojan_password=$($script:TROJAN_PASSWORD)
+SUB_TOKEN=$($script:SUB_TOKEN)
+CF_TUNNEL_TOKEN=
+CF_TUNNEL_ID=
+CF_TUNNEL_NAME=
+CF_TUNNEL_DOMAIN=
+ARGO_DOMAIN=
+"@ | Set-Content $PORTS_ENV -Encoding UTF8
+
+    # 限制文件权限
+    $acl = Get-Acl $PORTS_ENV
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $env:USERNAME, "FullControl", "Allow"
+    )
+    $acl.SetAccessRule($rule)
+    Set-Acl $PORTS_ENV $acl
+}
+
+# ============================================================
+# 下载函数
+# ============================================================
+function Download-File {
+    param(
+        [string]$Url,
+        [string]$Dest,
+        [string]$Desc = "文件"
+    )
+    Write-Info "下载 ${Desc}..."
+    try {
+        $wc = New-Object System.Net.WebClient
+        $wc.DownloadFile($Url, $Dest)
+    } catch {
+        # 回退到 Invoke-WebRequest
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Dest -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Die "下载失败 ${Desc}: $_"
+        }
+    }
+}
+
+function Get-LatestXrayVersion {
+    try {
+        $resp = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/XTLS/Xray-core/releases/latest" `
+            -UseBasicParsing -TimeoutSec 10
+        return $resp.tag_name
+    } catch {
+        Write-Warn "无法获取最新版本，使用 v26.3.27"
+        return "v26.3.27"
+    }
+}
+
+
+function Download-Xray {
+    Write-Step "下载 Xray-core"
+    $arch    = Get-Arch
+    $version = Get-LatestXrayVersion
+
+    $xrayArch = switch ($arch) {
+        "amd64" { "64" }
+        "arm64" { "arm64-v8a" }
+    }
+
+    $url  = "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-windows-${xrayArch}.zip"
+    $tmp  = Join-Path $env:TEMP "xray-windows.zip"
+    $extr = Join-Path $env:TEMP "xray-windows-extract"
+
+    Download-File -Url $url -Dest $tmp -Desc "Xray-core ${version} (${arch})"
+
+    if (Test-Path $extr) { Remove-Item $extr -Recurse -Force }
+    Expand-Archive -Path $tmp -DestinationPath $extr -Force
+
+    Copy-Item (Join-Path $extr "xray.exe") (Join-Path $INSTALL_DIR "xray.exe") -Force
+    Remove-Item $tmp, $extr -Recurse -Force -ErrorAction SilentlyContinue
+
+    Write-Info "Xray 已安装: $(Join-Path $INSTALL_DIR 'xray.exe')"
+}
+
+function Download-Argo {
+    Write-Step "下载 cloudflared"
+    $arch = Get-Arch
+
+    $url = switch ($arch) {
+        "amd64" { "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" }
+        "arm64" { "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-arm64.exe" }
+    }
+
+    Download-File -Url $url -Dest (Join-Path $INSTALL_DIR "cloudflared.exe") -Desc "cloudflared (${arch})"
+    Write-Info "cloudflared 已安装"
+}
+
+# ============================================================
+# 生成 Xray 配置
+# ============================================================
+function Generate-Config {
+    Write-Step "生成 Xray 配置"
+
+    $cfg = @"
+{
+  "log": {"loglevel": "warning"},
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"}
+    ]
+  },
+  "inbounds": [
+    {
+      "listen": "0.0.0.0",
+      "port": $($script:ARGO_PORT),
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "$($script:UUID)"}],
+        "decryption": "none",
+        "fallbacks": [
+          {"path": "/vless-argo?ed=2560",  "dest": 3001},
+          {"path": "/vmess-argo?ed=2560",  "dest": 3002},
+          {"path": "/trojan-argo?ed=2560", "dest": 3003}
+        ]
+      },
+      "streamSettings": {"network": "tcp"},
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "127.0.0.1", "port": 3001,
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "$($script:UUID)"}], "decryption": "none"},
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vless-argo?ed=2560"}},
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "127.0.0.1", "port": 3002,
+      "protocol": "vmess",
+      "settings": {"clients": [{"id": "$($script:UUID)", "alterId": 0}]},
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/vmess-argo?ed=2560"}},
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "127.0.0.1", "port": 3003,
+      "protocol": "trojan",
+      "settings": {"clients": [{"password": "$($script:TROJAN_PASSWORD)"}]},
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/trojan-argo?ed=2560"}},
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0", "port": $($script:XHTTP_PORT),
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "$($script:UUID)"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "xhttp", "security": "reality",
+        "realitySettings": {
+          "show": false, "dest": "www.nazhumi.com:443", "xver": 0,
+          "serverNames": ["www.nazhumi.com"],
+          "privateKey": "$($script:PRIVATE_KEY)", "shortIds": [""]
+        },
+        "xhttpSettings": {"mode": "auto"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0", "port": $($script:GRPC_PORT),
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "$($script:UUID)"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "grpc", "security": "reality",
+        "realitySettings": {
+          "show": false, "dest": "www.iij.ad.jp:443", "xver": 0,
+          "serverNames": ["www.iij.ad.jp"],
+          "privateKey": "$($script:PRIVATE_KEY)", "shortIds": [""]
+        },
+        "grpcSettings": {"serviceName": "grpc"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0", "port": $($script:VISION_PORT),
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "$($script:UUID)", "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp", "security": "reality",
+        "realitySettings": {
+          "show": false, "dest": "www.microsoft.com:443", "xver": 0,
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "$($script:PRIVATE_KEY)", "shortIds": [""]
+        }
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0", "port": $($script:SS_PORT),
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "$($script:SS_PASSWORD)",
+        "network": "tcp,udp"
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0", "port": $($script:H3_PORT),
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "$($script:UUID)"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "xhttp", "security": "reality",
+        "realitySettings": {
+          "show": false, "dest": "www.apple.com:443", "xver": 0,
+          "serverNames": ["www.apple.com"],
+          "privateKey": "$($script:PRIVATE_KEY)", "shortIds": [""]
+        },
+        "xhttpSettings": {"mode": "auto", "noSSEHeader": true}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    }
+  ],
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
+  ]
+}
+"@
+    $cfg | Set-Content (Join-Path $INSTALL_DIR "config.json") -Encoding UTF8
+    Write-Info "配置文件已生成"
+}
+
+# ============================================================
+# 订阅服务器 (Python)
+# ============================================================
+function Generate-SubServer {
+    $py = @'
+#!/usr/bin/env python3
+import os, base64, json, re
+import http.server, socketserver
+
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def load_env():
+    env = {}
+    f = os.path.join(INSTALL_DIR, "ports.env")
+    if os.path.exists(f):
+        for line in open(f, encoding='utf-8'):
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                env[k.strip()] = v.strip()
+    return env
+
+def get_ip():
+    import urllib.request
+    for u in ['https://api.ipify.org','https://ifconfig.me']:
+        try:
+            with urllib.request.urlopen(u, timeout=5) as r:
+                return r.read().decode().strip()
+        except: pass
+    return "unknown"
+
+def get_domain(env):
+    for k in ['CF_TUNNEL_DOMAIN','ARGO_DOMAIN']:
+        if env.get(k): return env[k]
+    if env.get('CF_TUNNEL_ID'):
+        return f"{env['CF_TUNNEL_ID']}.cfargotunnel.com"
+    lf = os.path.join(INSTALL_DIR, "logs", "argo.log")
+    if os.path.exists(lf):
+        for line in open(lf):
+            m = re.search(r'([a-z0-9\-]+\.trycloudflare\.com)', line)
+            if m: return m.group(1)
+    return ""
+
+def links(env, ip):
+    u   = env.get('UUID','')
+    pk  = env.get('public_key','')
+    ssp = env.get('ss_password','')
+    tp  = env.get('trojan_password','')
+    cdn = "cdns.doon.eu.org"
+    n   = ip
+    dom = get_domain(env)
+    out = []
+
+    out.append(f"vless://{u}@{ip}:{env.get('VISION_PORT','')}?"
+               f"encryption=none&flow=xtls-rprx-vision&security=reality"
+               f"&sni=www.microsoft.com&fp=chrome&pbk={pk}"
+               f"&type=tcp#{n}-Vision-Reality")
+
+    out.append(f"vless://{u}@{ip}:{env.get('XHTTP_PORT','')}?"
+               f"encryption=none&security=reality&sni=www.nazhumi.com"
+               f"&fp=chrome&pbk={pk}&allowInsecure=1"
+               f"&type=xhttp&mode=auto#{n}-XHTTP-Reality")
+
+    out.append(f"vless://{u}@{ip}:{env.get('GRPC_PORT','')}?"
+               f"encryption=none&security=reality&sni=www.iij.ad.jp"
+               f"&fp=chrome&pbk={pk}&allowInsecure=1"
+               f"&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#{n}-gRPC-Reality")
+
+    out.append(f"vless://{u}@{ip}:{env.get('XHTTP_H3_PORT','')}?"
+               f"encryption=none&security=reality&sni=www.apple.com"
+               f"&fp=chrome&pbk={pk}&allowInsecure=1"
+               f"&type=xhttp&mode=auto#{n}-XHTTP-H3-Reality")
+
+    ss = base64.b64encode(f"2022-blake3-aes-128-gcm:{ssp}".encode()).decode()
+    out.append(f"ss://{ss}@{ip}:{env.get('SS_PORT','')}#{n}-SS2022")
+
+    if dom:
+        out.append(f"vless://{u}@{cdn}:443?"
+                   f"encryption=none&security=tls&sni={dom}"
+                   f"&fp=chrome&type=ws&host={dom}"
+                   f"&path=%2Fvless-argo%3Fed%3D2560#{n}-VLESS-WS-Argo")
+
+        vmess = {"v":"2","ps":f"{n}-VMess-WS-Argo","add":cdn,
+                 "port":"443","id":u,"aid":"0","scy":"none",
+                 "net":"ws","type":"none","host":dom,
+                 "path":"/vmess-argo?ed=2560","tls":"tls",
+                 "sni":dom,"alpn":"","fp":"chrome"}
+        out.append(f"vmess://{base64.b64encode(json.dumps(vmess).encode()).decode()}")
+
+        out.append(f"trojan://{tp}@{cdn}:443?"
+                   f"security=tls&sni={dom}&fp=chrome"
+                   f"&type=ws&host={dom}"
+                   f"&path=%2Ftrojan-argo%3Fed%3D2560#{n}-Trojan-WS-Argo")
+
+    return "\n".join(out)
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        env = load_env()
+        if self.path != f"/{env.get('SUB_TOKEN','')}":
+            self.send_response(404); self.end_headers(); return
+        ip   = get_ip()
+        body = base64.b64encode(links(env, ip).encode()).decode()
+        self.send_response(200)
+        self.send_header("Content-Type","text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+if __name__ == "__main__":
+    env  = load_env()
+    port = int(env.get('SUB_PORT', 49023))
+    with socketserver.TCPServer(("0.0.0.0", port), Handler) as s:
+        s.serve_forever()
+'@
+    $py | Set-Content (Join-Path $INSTALL_DIR "sub_server.py") -Encoding UTF8
+}
+
+# ============================================================
+# 进程管理
+# ============================================================
+function Start-XrayProcess {
+    param([hashtable]$Env)
+    $xray   = Join-Path $INSTALL_DIR "xray.exe"
+    $config = Join-Path $INSTALL_DIR "config.json"
+    $log    = Join-Path $LOG_DIR "xray.log"
+
+    # 轮转日志
+    Rotate-Log $log
+
+    $proc = Start-Process -FilePath $xray `
+        -ArgumentList "run -c `"$config`"" `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $log `
+        -RedirectStandardError (Join-Path $LOG_DIR "xray-error.log") `
+        -PassThru
+    Write-Info "Xray 已启动 PID: $($proc.Id)"
+    return $proc
+}
+
+function Start-TunnelProcess {
+    param([hashtable]$Env)
+    $argo = Join-Path $INSTALL_DIR "cloudflared.exe"
+    $log  = Join-Path $LOG_DIR "argo.log"
+
+    Rotate-Log $log
+
+    $token    = $Env["CF_TUNNEL_TOKEN"]
+    $argoPort = $Env["ARGO_PORT"]
+
+    if ($token) {
+        $args = "tunnel --no-autoupdate run --token $token"
+    } else {
+        $args = "tunnel --url http://localhost:$argoPort --no-autoupdate --edge-ip-version auto --protocol http2"
+    }
+
+    $proc = Start-Process -FilePath $argo `
+        -ArgumentList $args `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $log `
+        -RedirectStandardError (Join-Path $LOG_DIR "argo-error.log") `
+        -PassThru
+    Write-Info "Tunnel 已启动 PID: $($proc.Id)"
+    return $proc
+}
+
+function Start-SubProcess {
+    param([hashtable]$Env)
+    $py  = Get-PythonPath
+    $log = Join-Path $LOG_DIR "sub.log"
+    if (-not $py) { Write-Warn "未找到 Python3，跳过订阅服务"; return }
+
+    Rotate-Log $log
+
+    $proc = Start-Process -FilePath $py `
+        -ArgumentList "`"$(Join-Path $INSTALL_DIR 'sub_server.py')`"" `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $log `
+        -RedirectStandardError (Join-Path $LOG_DIR "sub-error.log") `
+        -PassThru
+    Write-Info "订阅服务已启动 PID: $($proc.Id)"
+}
+
+function Get-PythonPath {
+    foreach ($py in @("python3", "python", "py")) {
+        $p = Get-Command $py -ErrorAction SilentlyContinue
+        if ($p) { return $p.Source }
+    }
+    # 查找常见安装路径
+    $candidates = @(
+        "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\python3.exe",
+        "C:\Python3*\python.exe"
+    )
+    foreach ($c in $candidates) {
+        $found = Get-Item $c -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($found) { return $found.FullName }
     }
     return $null
 }
 
-# ==========================================
-# 安装 NSSM
-# ==========================================
-function Install-NSSM {
-    if (Test-Path $NssmPath) {
-        Write-Green 'nssm already installed'
-        return
+function Stop-AllProcesses {
+    Write-Info "停止所有进程..."
+    @("xray", "cloudflared") | ForEach-Object {
+        Get-Process -Name $_ -ErrorAction SilentlyContinue | ForEach-Object {
+            # 只停止来自安装目录的进程
+            if ($_.Path -like "*$INSTALL_DIR*") {
+                Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+                Write-Info "已停止: $($_.Name) PID=$($_.Id)"
+            }
+        }
     }
-    Write-Yellow '正在下载 NSSM...'
-    $nssmUrl = 'https://nssm.cc/release/nssm-2.24.zip'
-    $nssmZip = "$WorkDir\nssm.zip"
+    # 订阅服务
+    Get-Process -Name "python*" -ErrorAction SilentlyContinue | ForEach-Object {
+        $cmdline = (Get-WmiObject Win32_Process -Filter "ProcessId=$($_.Id)" `
+            -ErrorAction SilentlyContinue).CommandLine
+        if ($cmdline -like "*sub_server.py*") {
+            Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Rotate-Log {
+    param([string]$LogFile)
+    if (Test-Path $LogFile) {
+        $size = (Get-Item $LogFile).Length
+        if ($size -gt 50MB) {
+            $tail = Get-Content $LogFile -Tail 1000
+            $tail | Set-Content $LogFile -Encoding UTF8
+        }
+    }
+}
+
+# ============================================================
+# 不死鸟持久化
+# ============================================================
+
+# --- 看门狗脚本 ---
+function Generate-WatchdogScript {
+    $wd = @'
+# Xray-2go Windows 看门狗
+$INSTALL_DIR = Split-Path -Parent $MyInvocation.MyCommand.Path
+$LOG_DIR     = Join-Path $INSTALL_DIR "logs"
+$LOG         = Join-Path $LOG_DIR "watchdog.log"
+
+New-Item -ItemType Directory -Force -Path $LOG_DIR | Out-Null
+
+function wlog {
+    param([string]$m)
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "[$ts] $m"
+    # 轮转 2MB
+    if ((Test-Path $LOG) -and (Get-Item $LOG).Length -gt 2MB) {
+        Get-Content $LOG -Tail 200 | Set-Content $LOG -Encoding UTF8
+    }
+    Add-Content -Path $LOG -Value $line -Encoding UTF8
+}
+
+function Load-Env {
+    $t = @{}
+    $f = Join-Path $INSTALL_DIR "ports.env"
+    if (Test-Path $f) {
+        Get-Content $f | ForEach-Object {
+            if ($_ -match '^([^#=]+)=(.*)$') { $t[$Matches[1].Trim()]=$Matches[2].Trim() }
+        }
+    }
+    return $t
+}
+
+function Rebuild-Persist {
+    wlog "ALERT: 持久化条目丢失，正在重建..."
+    & (Join-Path $INSTALL_DIR "setup-persist.ps1") 2>&1 | Out-Null
+    wlog "REPAIR: 持久化已重建"
+}
+
+$env = Load-Env
+$xrayExe  = Join-Path $INSTALL_DIR "xray.exe"
+$argoExe  = Join-Path $INSTALL_DIR "cloudflared.exe"
+$bootPs1  = Join-Path $INSTALL_DIR "xray-boot.ps1"
+
+# === 检查 1: Xray 进程 ===
+$xrayRunning = Get-Process -Name "xray" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "*$INSTALL_DIR*" }
+if (-not $xrayRunning) {
+    wlog "ALERT: Xray 未运行"
+    $log = Join-Path $INSTALL_DIR "logs\xray.log"
+    Start-Process -FilePath $xrayExe `
+        -ArgumentList "run -c `"$(Join-Path $INSTALL_DIR 'config.json')`"" `
+        -WindowStyle Hidden -PassThru | Out-Null
+    wlog "REPAIR: Xray 已重启"
+    Start-Sleep -Seconds 2
+}
+
+# === 检查 2: Tunnel 进程 ===
+$argoRunning = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -like "*$INSTALL_DIR*" }
+if (-not $argoRunning) {
+    wlog "ALERT: Tunnel 未运行"
+    $token    = $env["CF_TUNNEL_TOKEN"]
+    $argoPort = $env["ARGO_PORT"]
+    if ($token) {
+        $argoArgs = "tunnel --no-autoupdate run --token $token"
+    } else {
+        $argoArgs = "tunnel --url http://localhost:$argoPort --no-autoupdate --edge-ip-version auto --protocol http2"
+    }
+    Start-Process -FilePath $argoExe `
+        -ArgumentList $argoArgs `
+        -WindowStyle Hidden -PassThru | Out-Null
+    wlog "REPAIR: Tunnel 已重启"
+}
+
+# === 检查 3: 计划任务自愈 ===
+$bootTask = Get-ScheduledTask -TaskName "Xray2goBoot" -ErrorAction SilentlyContinue
+$wdTask   = Get-ScheduledTask -TaskName "Xray2goWatchdog" -ErrorAction SilentlyContinue
+if (-not $bootTask -or -not $wdTask) {
+    wlog "ALERT: 计划任务丢失"
+    Rebuild-Persist
+}
+
+# === 检查 4: 注册表自愈 ===
+$regVal = Get-ItemProperty `
+    -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+    -Name "Xray2go" -ErrorAction SilentlyContinue
+if (-not $regVal) {
+    wlog "ALERT: 注册表启动项丢失"
+    Set-ItemProperty `
+        -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+        -Name "Xray2go" `
+        -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$bootPs1`""
+    wlog "REPAIR: 注册表启动项已恢复"
+}
+
+# === 检查 5: Startup 快捷方式自愈 ===
+$startupDir = [IO.Path]::Combine($env:APPDATA,
+    "Microsoft\Windows\Start Menu\Programs\Startup")
+$lnk = Join-Path $startupDir "Xray2go.lnk"
+if (-not (Test-Path $lnk)) {
+    wlog "ALERT: Startup 快捷方式丢失"
+    $shell    = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($lnk)
+    $shortcut.TargetPath  = "powershell.exe"
+    $shortcut.Arguments   = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$bootPs1`""
+    $shortcut.WindowStyle = 7
+    $shortcut.Save()
+    wlog "REPAIR: Startup 快捷方式已恢复"
+}
+'@
+    $wd | Set-Content (Join-Path $INSTALL_DIR "watchdog.ps1") -Encoding UTF8
+}
+
+# --- 启动脚本 ---
+function Generate-BootScript {
+    $boot = @"
+# Xray-2go Windows 启动脚本
+`$INSTALL_DIR = Split-Path -Parent `$MyInvocation.MyCommand.Path
+`$LOG_DIR     = Join-Path `$INSTALL_DIR "logs"
+`$LOG         = Join-Path `$LOG_DIR "boot.log"
+
+New-Item -ItemType Directory -Force -Path `$LOG_DIR | Out-Null
+
+function wlog {
+    param([string]`$m)
+    Add-Content -Path `$LOG -Value "[`$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] BOOT: `$m" -Encoding UTF8
+}
+
+wlog "启动脚本执行"
+
+function Load-Env {
+    `$t = @{}
+    `$f = Join-Path `$INSTALL_DIR "ports.env"
+    if (Test-Path `$f) {
+        Get-Content `$f | ForEach-Object {
+            if (`$_ -match '^([^#=]+)=(.*)$') { `$t[`$Matches[1].Trim()]=`$Matches[2].Trim() }
+        }
+    }
+    return `$t
+}
+
+# 等待网络
+for (`$i = 1; `$i -le 30; `$i++) {
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $nssmUrl -OutFile $nssmZip -UseBasicParsing
-        Expand-Archive -Path $nssmZip -DestinationPath "$WorkDir\nssm_tmp" -Force
-        $nssmExe = Get-ChildItem -Path "$WorkDir\nssm_tmp" -Recurse -Filter 'nssm.exe' |
-            Where-Object { $_.DirectoryName -like '*win64*' } |
-            Select-Object -First 1
-        if (-not $nssmExe) {
-            $nssmExe = Get-ChildItem -Path "$WorkDir\nssm_tmp" -Recurse -Filter 'nssm.exe' |
-                Select-Object -First 1
-        }
-        Copy-Item $nssmExe.FullName $NssmPath -Force
-        Remove-Item "$WorkDir\nssm_tmp" -Recurse -Force
-        Remove-Item $nssmZip -Force
-        Write-Green 'NSSM 安装成功'
-    }
-    catch {
-        Write-Red "NSSM 下载失败: $($_.Exception.Message)"
-    }
+        `$null = Test-Connection -ComputerName "1.1.1.1" -Count 1 -ErrorAction Stop
+        wlog "网络就绪 (第 `${i} 次)"
+        break
+    } catch { Start-Sleep -Seconds 2 }
 }
 
-# ==========================================
-# 安装 Caddy
-# ==========================================
-function Install-Caddy {
-    if (Test-Path "$WorkDir\caddy.exe") {
-        Write-Green 'caddy already installed'
-        return
-    }
-    Write-Yellow '正在下载 caddy...'
-    $archInfo = Get-Arch
-    $caddyVersion = '2.9.1'
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/caddyserver/caddy/releases/latest' -UseBasicParsing
-        $caddyVersion = $release.tag_name -replace '^v', ''
-    }
-    catch {
-        Write-Yellow "无法获取最新版本，使用默认 $caddyVersion"
-    }
+`$env     = Load-Env
+`$xrayExe = Join-Path `$INSTALL_DIR "xray.exe"
+`$argoExe = Join-Path `$INSTALL_DIR "cloudflared.exe"
+`$pyPath  = "$( (Get-PythonPath) ?? 'python' )"
+`$subPy   = Join-Path `$INSTALL_DIR "sub_server.py"
 
-    $caddyUrl = "https://github.com/caddyserver/caddy/releases/download/v$caddyVersion/caddy_${caddyVersion}_windows_$($archInfo.ARCH).zip"
-    $caddyZip = "$WorkDir\caddy.zip"
-    try {
-        Invoke-WebRequest -Uri $caddyUrl -OutFile $caddyZip -UseBasicParsing
-        Expand-Archive -Path $caddyZip -DestinationPath "$WorkDir\caddy_tmp" -Force
-        Copy-Item "$WorkDir\caddy_tmp\caddy.exe" "$WorkDir\caddy.exe" -Force
-        Remove-Item "$WorkDir\caddy_tmp" -Recurse -Force
-        Remove-Item $caddyZip -Force
-        Write-Green "caddy v$caddyVersion 安装成功"
-    }
-    catch {
-        Write-Red "caddy 下载失败: $($_.Exception.Message)"
-    }
+# 启动 Xray
+`$xrayRunning = Get-Process -Name "xray" -ErrorAction SilentlyContinue |
+    Where-Object { `$_.Path -like "*`$INSTALL_DIR*" }
+if (-not `$xrayRunning) {
+    Start-Process -FilePath `$xrayExe ``
+        -ArgumentList "run -c ```"`$(Join-Path `$INSTALL_DIR 'config.json')```"" ``
+        -WindowStyle Hidden -PassThru | Out-Null
+    wlog "Xray 已启动"
+    Start-Sleep -Seconds 2
 }
 
-# ==========================================
-# 安装 jq
-# ==========================================
-function Install-Jq {
-    if (Test-Path "$WorkDir\jq.exe") {
-        Write-Green 'jq already installed'
-        return
+# 启动 Tunnel
+`$argoRunning = Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue |
+    Where-Object { `$_.Path -like "*`$INSTALL_DIR*" }
+if (-not `$argoRunning) {
+    `$token    = `$env["CF_TUNNEL_TOKEN"]
+    `$argoPort = `$env["ARGO_PORT"]
+    if (`$token) {
+        `$argoArgs = "tunnel --no-autoupdate run --token `$token"
+    } else {
+        `$argoArgs = "tunnel --url http://localhost:`$argoPort --no-autoupdate --edge-ip-version auto --protocol http2"
     }
-    Write-Yellow '正在下载 jq...'
-    $archInfo = Get-Arch
-    $jqArch = 'amd64'
-    if ($archInfo.ARCH -eq 'arm64') { $jqArch = 'arm64' }
-    $jqUrl = "https://github.com/jqlang/jq/releases/latest/download/jq-windows-$jqArch.exe"
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        Invoke-WebRequest -Uri $jqUrl -OutFile "$WorkDir\jq.exe" -UseBasicParsing
-        Write-Green 'jq 安装成功'
-    }
-    catch {
-        Write-Red "jq 下载失败: $($_.Exception.Message)"
-    }
+    Start-Process -FilePath `$argoExe ``
+        -ArgumentList `$argoArgs ``
+        -WindowStyle Hidden -PassThru | Out-Null
+    wlog "Tunnel 已启动"
 }
 
-# ==========================================
-# 安装 Xray + Cloudflared
-# ==========================================
-function Install-Xray {
-    Clear-Host
-    Write-Purple '正在安装 Xray-2go (Windows) 中，请稍等...'
-    $archInfo = Get-Arch
-
-    Assign-Ports
-
-    if (-not (Test-Path $WorkDir)) {
-        New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
-    }
-
-    $script:UUID = New-UUID
-    $script:password = New-Password
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    # 下载 Xray
-    Write-Yellow '下载 Xray...'
-    $xrayUrl = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-$($archInfo.ARCH_ARG).zip"
-    $xrayZip = "$WorkDir\xray.zip"
-    try {
-        Invoke-WebRequest -Uri $xrayUrl -OutFile $xrayZip -UseBasicParsing
-        Expand-Archive -Path $xrayZip -DestinationPath "$WorkDir\xray_tmp" -Force
-        Copy-Item "$WorkDir\xray_tmp\xray.exe" "$WorkDir\xray.exe" -Force
-        Remove-Item "$WorkDir\xray_tmp" -Recurse -Force
-        Remove-Item $xrayZip -Force
-        Write-Green 'Xray 下载完成'
-    }
-    catch {
-        Write-Red "Xray 下载失败: $($_.Exception.Message)"
-        return
-    }
-
-    # 下载 Cloudflared
-    Write-Yellow '下载 cloudflared...'
-    $cfArch = 'amd64'
-    if ($archInfo.ARCH -eq 'arm64') { $cfArch = 'arm64' }
-    $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-$cfArch.exe"
-    try {
-        Invoke-WebRequest -Uri $cfUrl -OutFile "$WorkDir\argo.exe" -UseBasicParsing
-        Write-Green 'cloudflared 下载完成'
-    }
-    catch {
-        Write-Red "cloudflared 下载失败: $($_.Exception.Message)"
-        return
-    }
-
-    # 生成密钥对
-    Write-Yellow '生成密钥对...'
-    $output = & "$WorkDir\xray.exe" x25519 2>&1 | Out-String
-    $lines = $output -split "`n"
-    foreach ($ln in $lines) {
-        if ($ln -match 'Private.*:\s*(\S+)') {
-            $script:privateKey = $matches[1]
-        }
-        if ($ln -match 'Public.*:\s*(\S+)') {
-            $script:publicKey = $matches[1]
-        }
-    }
-
-    if (-not $script:privateKey -or -not $script:publicKey) {
-        Write-Red 'x25519 密钥生成失败'
-        Write-Yellow "输出: $output"
-        return
-    }
-    Write-Green '密钥对生成成功'
-
-    Save-Ports
-
-    # 防火墙
-    Write-Yellow '配置防火墙规则...'
-    [int[]]$ports = @($script:PORT, $script:ARGO_PORT, $script:GRPC_PORT, $script:XHTTP_PORT)
-    foreach ($p in $ports) {
-        $ruleName = "Xray2go_Port_$p"
-        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p -ErrorAction SilentlyContinue | Out-Null
-    }
-    # 内部端口
-    foreach ($p in @(3001, 3002, 3003)) {
-        $ruleName = "Xray2go_Internal_$p"
-        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p -ErrorAction SilentlyContinue | Out-Null
-    }
-    Write-Green '防火墙规则已添加'
-
-    # 生成配置
-    $configJson = @{
-        log = @{ access = 'none'; error = 'none'; loglevel = 'none' }
-        inbounds = @(
-            @{
-                port = [int]$script:ARGO_PORT
-                protocol = 'vless'
-                settings = @{
-                    clients = @( @{ id = $script:UUID; flow = 'xtls-rprx-vision' } )
-                    decryption = 'none'
-                    fallbacks = @(
-                        @{ dest = 3001 },
-                        @{ path = '/vless-argo'; dest = 3002 },
-                        @{ path = '/vmess-argo'; dest = 3003 }
-                    )
-                }
-                streamSettings = @{ network = 'tcp' }
-            },
-            @{
-                port = 3001; listen = '127.0.0.1'; protocol = 'vless'
-                settings = @{ clients = @( @{ id = $script:UUID } ); decryption = 'none' }
-                streamSettings = @{ network = 'tcp'; security = 'none' }
-            },
-            @{
-                port = 3002; listen = '127.0.0.1'; protocol = 'vless'
-                settings = @{ clients = @( @{ id = $script:UUID; level = 0 } ); decryption = 'none' }
-                streamSettings = @{ network = 'ws'; security = 'none'; wsSettings = @{ path = '/vless-argo' } }
-                sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic'); metadataOnly = $false }
-            },
-            @{
-                port = 3003; listen = '127.0.0.1'; protocol = 'vmess'
-                settings = @{ clients = @( @{ id = $script:UUID; alterId = 0 } ) }
-                streamSettings = @{ network = 'ws'; wsSettings = @{ path = '/vmess-argo' } }
-                sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic'); metadataOnly = $false }
-            },
-            @{
-                listen = '::'; port = [int]$script:XHTTP_PORT; protocol = 'vless'
-                settings = @{ clients = @( @{ id = $script:UUID } ); decryption = 'none' }
-                streamSettings = @{
-                    network = 'xhttp'; security = 'reality'
-                    realitySettings = @{
-                        target = 'www.nazhumi.com:443'; xver = 0
-                        serverNames = @('www.nazhumi.com')
-                        privateKey = $script:privateKey; shortIds = @('')
-                    }
-                }
-                sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic') }
-            },
-            @{
-                listen = '::'; port = [int]$script:GRPC_PORT; protocol = 'vless'
-                settings = @{ clients = @( @{ id = $script:UUID } ); decryption = 'none' }
-                streamSettings = @{
-                    network = 'grpc'; security = 'reality'
-                    realitySettings = @{
-                        dest = 'www.iij.ad.jp:443'
-                        serverNames = @('www.iij.ad.jp')
-                        privateKey = $script:privateKey; shortIds = @('')
-                    }
-                    grpcSettings = @{ serviceName = 'grpc' }
-                }
-                sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic') }
-            }
-        )
-        dns = @{ servers = @('https+local://8.8.8.8/dns-query') }
-        outbounds = @(
-            @{ protocol = 'freedom'; tag = 'direct' },
-            @{ protocol = 'blackhole'; tag = 'block' }
-        )
-    }
-
-    $configJson | ConvertTo-Json -Depth 20 | Out-File -FilePath $ConfigDir -Encoding UTF8
-    Write-Green '配置文件已生成'
+# 启动订阅服务
+`$subRunning = Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {
+    `$cmdline = (Get-WmiObject Win32_Process -Filter "ProcessId=`$(`$_.Id)" -EA SilentlyContinue).CommandLine
+    `$cmdline -like "*sub_server.py*"
+}
+if (-not `$subRunning -and (Test-Path `$subPy)) {
+    Start-Process -FilePath `$pyPath ``
+        -ArgumentList "`"`$subPy`"" ``
+        -WindowStyle Hidden -PassThru | Out-Null
+    wlog "订阅服务已启动"
 }
 
-# ==========================================
-# 服务安装
-# ==========================================
-function Install-Services {
-    Load-Ports
-
-    Write-Yellow '正在创建 Xray 服务...'
-    & $NssmPath stop xray 2>$null
-    & $NssmPath remove xray confirm 2>$null
-    & $NssmPath install xray "$WorkDir\xray.exe" "run -c `"$ConfigDir`""
-    & $NssmPath set xray AppDirectory "$WorkDir"
-    & $NssmPath set xray DisplayName 'Xray Service'
-    & $NssmPath set xray Start SERVICE_AUTO_START
-    & $NssmPath set xray AppStdout "$WorkDir\xray_out.log"
-    & $NssmPath set xray AppStderr "$WorkDir\xray_error.log"
-    & $NssmPath start xray
-    Write-Green 'Xray 服务已创建并启动'
-
-    Write-Yellow '正在创建 Argo Tunnel 服务...'
-    & $NssmPath stop cloudflared-tunnel 2>$null
-    & $NssmPath remove cloudflared-tunnel confirm 2>$null
-    $argoArgs = "tunnel --url http://localhost:$($script:ARGO_PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
-    & $NssmPath install cloudflared-tunnel "$WorkDir\argo.exe" $argoArgs
-    & $NssmPath set cloudflared-tunnel AppDirectory "$WorkDir"
-    & $NssmPath set cloudflared-tunnel DisplayName 'Cloudflare Tunnel'
-    & $NssmPath set cloudflared-tunnel Start SERVICE_AUTO_START
-    & $NssmPath set cloudflared-tunnel AppStdout "$WorkDir\argo.log"
-    & $NssmPath set cloudflared-tunnel AppStderr "$WorkDir\argo.log"
-    & $NssmPath start cloudflared-tunnel
-    Write-Green 'Argo Tunnel 服务已创建并启动'
+wlog "启动完毕"
+"@
+    $boot | Set-Content (Join-Path $INSTALL_DIR "xray-boot.ps1") -Encoding UTF8
 }
 
-function Install-CaddyService {
-    Load-Ports
+# --- 持久化安装 ---
+function Setup-Persist {
+    Write-Step "安装不死鸟持久化"
 
-    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
-    $workDirForward = $WorkDir -replace '\\','/'
+    $bootPs1 = Join-Path $INSTALL_DIR "xray-boot.ps1"
+    $wdPs1   = Join-Path $INSTALL_DIR "watchdog.ps1"
 
-    $caddyLines = @()
-    $caddyLines += '{'
-    $caddyLines += '    auto_https off'
-    $caddyLines += '}'
-    $caddyLines += ''
-    $caddyLines += ":$($script:PORT) {"
-    $caddyLines += "    handle /$($script:password) {"
-    $caddyLines += "        root * $workDirForward"
-    $caddyLines += '        try_files /sub.txt'
-    $caddyLines += '        file_server browse'
-    $caddyLines += '        header Content-Type "text/plain; charset=utf-8"'
-    $caddyLines += '    }'
-    $caddyLines += ''
-    $caddyLines += '    handle {'
-    $caddyLines += '        respond "404 Not Found" 404'
-    $caddyLines += '    }'
-    $caddyLines += '}'
+    # === 层 1: Task Scheduler ===
+    Write-Info "[层1] 创建计划任务..."
 
-    $caddyLines -join "`r`n" | Out-File -FilePath $caddyFilePath -Encoding UTF8
+    # 启动任务
+    $bootAction   = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$bootPs1`""
+    $bootTrigger  = New-ScheduledTaskTrigger -AtLogOn
+    $bootSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -RestartCount 999 `
+        -RestartInterval (New-TimeSpan -Seconds 10) `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 0)
 
-    & $NssmPath stop caddy 2>$null
-    & $NssmPath remove caddy confirm 2>$null
-    $caddyArgs = "run --config `"$caddyFilePath`""
-    $caddyExe = Join-Path $WorkDir 'caddy.exe'
-    & $NssmPath install caddy $caddyExe $caddyArgs
-    & $NssmPath set caddy AppDirectory $WorkDir
-    & $NssmPath set caddy DisplayName 'Caddy Web Server'
-    & $NssmPath set caddy Start SERVICE_AUTO_START
-    $caddyOut = Join-Path $WorkDir 'caddy_out.log'
-    $caddyErr = Join-Path $WorkDir 'caddy_error.log'
-    & $NssmPath set caddy AppStdout $caddyOut
-    & $NssmPath set caddy AppStderr $caddyErr
-    & $NssmPath start caddy
-    Write-Green 'Caddy started'
+    Register-ScheduledTask `
+        -TaskName "Xray2goBoot" `
+        -Action $bootAction `
+        -Trigger $bootTrigger `
+        -Settings $bootSettings `
+        -Force | Out-Null
+    Write-Info "  ✅ 登录启动任务已创建"
+
+    # 看门狗任务（每 60 秒）
+    $wdAction   = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$wdPs1`""
+    $wdTrigger  = New-ScheduledTaskTrigger -Once `
+        -At (Get-Date) `
+        -RepetitionInterval (New-TimeSpan -Minutes 1) `
+        -RepetitionDuration (New-TimeSpan -Days 36500)
+    $wdSettings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+    Register-ScheduledTask `
+        -TaskName "Xray2goWatchdog" `
+        -Action $wdAction `
+        -Trigger $wdTrigger `
+        -Settings $wdSettings `
+        -Force | Out-Null
+    Write-Info "  ✅ 看门狗任务已创建 (每60秒)"
+
+    # === 层 2: Startup 文件夹 ===
+    Write-Info "[层2] 创建 Startup 快捷方式..."
+    $startupDir = [IO.Path]::Combine(
+        $env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
+    New-Item -ItemType Directory -Force -Path $startupDir | Out-Null
+
+    $shell    = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut((Join-Path $startupDir "Xray2go.lnk"))
+    $shortcut.TargetPath  = "powershell.exe"
+    $shortcut.Arguments   = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$bootPs1`""
+    $shortcut.WindowStyle = 7
+    $shortcut.Description = "Xray2go Auto Start"
+    $shortcut.Save()
+    Write-Info "  ✅ Startup 快捷方式已创建"
+
+    # === 层 3: 注册表 HKCU\Run ===
+    Write-Info "[层3] 添加注册表启动项..."
+    Set-ItemProperty `
+        -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+        -Name "Xray2go" `
+        -Value "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$bootPs1`""
+    Write-Info "  ✅ 注册表 HKCU\Run 已添加"
+
+    # === 层 4: 隐藏目录 ===
+    Write-Info "[层4] 隐藏安装目录..."
+    $dirInfo = Get-Item $INSTALL_DIR -Force
+    $dirInfo.Attributes = $dirInfo.Attributes -bor [IO.FileAttributes]::Hidden
+    Write-Info "  ✅ 目录已隐藏"
+
+    Write-Info ""
+    Write-Info "🐦‍🔥 Windows 不死鸟持久化已激活！"
+    Write-Info ""
+    Write-Info "  防护层:"
+    Write-Info "  ✅ 层1: 计划任务 (登录启动 + 每60s看门狗)"
+    Write-Info "  ✅ 层2: Startup 文件夹快捷方式"
+    Write-Info "  ✅ 层3: 注册表 HKCU\Run"
+    Write-Info "  ✅ 层4: 安装目录隐藏"
+    Write-Info "  ✅ 看门狗自愈 (任务/注册表/快捷方式被删自动重建)"
 }
 
-function Get-CaddyInfo {
-    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
-    $result = @{ Port = $script:PORT; Path = $script:password }
-    if (Test-Path $caddyFilePath) {
-        $cc = Get-Content $caddyFilePath -Raw
-        $portPattern = ':(\d+)\s*\{'
-        $pathPattern = 'handle /(\w+)'
-        if ($cc -match $portPattern) { $result.Port = $matches[1] }
-        if ($cc -match $pathPattern) { $result.Path = $matches[1] }
-    }
-    return $result
-}
-
-
-# ==========================================
-# 获取信息并生成节点
-# ==========================================
-function Get-Info {
-    Clear-Host
-    Load-Ports
-
-    $IP = Get-RealIP
-
-    $isp = 'vps'
-    try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-        $geoData = Invoke-RestMethod -Uri 'https://api.ip.sb/geoip' -TimeoutSec 3 -Headers @{ 'User-Agent' = 'Mozilla/5.0' } -UseBasicParsing
-        $isp = "$($geoData.country_code)-$($geoData.isp)" -replace ' ', '_'
-    }
-    catch {
-        $isp = 'vps'
-    }
-
-    # 获取 Argo 域名
-    $argodomain = $null
-    $argoLog = "$WorkDir\argo.log"
-    for ($i = 1; $i -le 10; $i++) {
-        Write-Purple "第 $i 次尝试获取 ArgoDomain 中..."
-        $argodomain = Get-ArgoDomain -LogFile $argoLog
-        if ($argodomain) { break }
-        Start-Sleep -Seconds 3
-    }
-
-    if (-not $argodomain) {
-        Write-Red '获取 Argo 临时域名失败，请稍后重试'
-        $argodomain = 'failed.trycloudflare.com'
-    }
-
-    Write-Green "`nArgoDomain: $argodomain`n"
-
-    # VMess JSON
-    $vmessObj = @{
-        v    = '2'; ps = $isp; add = $CFIP; port = $CFPORT
-        id   = $script:UUID; aid = '0'; scy = 'none'; net = 'ws'
-        type = 'none'; host = $argodomain; path = '/vmess-argo?ed=2560'
-        tls  = 'tls'; sni = $argodomain; alpn = ''; fp = 'chrome'
-    }
-    $vmessJson = $vmessObj | ConvertTo-Json -Compress
-    $vmessBase64 = ConvertTo-Base64 -Text $vmessJson
-
-    $urlLines = @(
-        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}",
-        '',
-        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}",
-        '',
-        "vless://$($script:UUID)@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}",
-        '',
-        "vmess://${vmessBase64}",
-        ''
-    )
-
-    $urlContent = $urlLines -join "`r`n"
-    $urlContent | Out-File -FilePath $ClientDir -Encoding UTF8
-
-    Write-Purple $urlContent
-
-    $subBase64 = ConvertTo-Base64 -Text $urlContent
-    $subBase64 | Out-File -FilePath "$WorkDir\sub.txt" -Encoding UTF8 -NoNewline
-
-    Write-Yellow "`n温馨提醒：如果是 NAT 机，reality 端口和订阅端口需使用可用端口范围内的端口`n"
-    Write-Green "节点订阅链接：http://${IP}:$($script:PORT)/$($script:password)"
-    Write-Green "`n订阅链接适用于 V2rayN, NekoBox, Karing, Shadowrocket, Loon, 圈X 等`n"
-
-    Export-ProxyTxt -Mode 'auto'
-}
-
-# ==========================================
-# 导出代理为 txt
-# ==========================================
-function Export-ProxyTxt {
-    param(
-        [string]$Mode = 'manual',
-        [string]$TargetDir = $ExportDir
-    )
-
-    Load-Ports
-
-    if (-not (Test-Path $ClientDir)) {
-        Write-Red 'No node file found'
-        return
-    }
-
-    $IP = Get-RealIP
-    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $exportFile = Join-Path $TargetDir "xray2go_proxy_${timestamp}.txt"
-    $exportFileLatest = Join-Path $TargetDir 'xray2go_proxy_latest.txt'
-
-    $argoLog = Join-Path $WorkDir 'argo.log'
-    $argodomain = Get-ArgoDomain -LogFile $argoLog
-
-    $info = Get-CaddyInfo
-    $subPort = $info.Port
-    $subPath = $info.Path
-
-    $urlContent = Get-Content $ClientDir -ErrorAction SilentlyContinue
-    $lineGrpc  = $urlContent | Where-Object { $_ -match 'grpc' }  | Select-Object -First 1
-    $lineXhttp = $urlContent | Where-Object { $_ -match 'xhttp' } | Select-Object -First 1
-    $lineWs    = $urlContent | Where-Object { ($_ -match 'vless') -and ($_ -match 'ws') } | Select-Object -First 1
-    $lineVmess = $urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1
-
-    $adStr = if ($argodomain) { $argodomain } else { 'N/A' }
-    $subLink = "http://${IP}:${subPort}/${subPath}"
-
-    $lines = @()
-    $lines += '============================================'
-    $lines += '  Xray-2go Proxy Info (Windows)'
-    $lines += "  Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-    $lines += "  Server: ${IP}"
-    $lines += '============================================'
-    $lines += ''
-    $lines += "PORT:       ${subPort}"
-    $lines += "ARGO_PORT:  $($script:ARGO_PORT)"
-    $lines += "GRPC_PORT:  $($script:GRPC_PORT)"
-    $lines += "XHTTP_PORT: $($script:XHTTP_PORT)"
-    $lines += ''
-    $lines += "UUID: $($script:UUID)"
-    $lines += "Argo Domain: $adStr"
-    $lines += ''
-    $lines += '============================================'
-    $lines += '  Node Links'
-    $lines += '============================================'
-    $lines += ''
-    $lines += '--- VLESS GRPC Reality ---'
-    $lines += $lineGrpc
-    $lines += ''
-    $lines += '--- VLESS XHTTP Reality ---'
-    $lines += $lineXhttp
-    $lines += ''
-    $lines += '--- VLESS WS (Argo) ---'
-    $lines += $lineWs
-    $lines += ''
-    $lines += '--- VMess WS (Argo) ---'
-    $lines += $lineVmess
-    $lines += ''
-    $lines += '============================================'
-    $lines += '  Subscribe'
-    $lines += '============================================'
-    $lines += ''
-    $lines += $subLink
-    $lines += ''
-    $lines += '============================================'
-
-    $lines -join "`r`n" | Out-File -FilePath $exportFile -Encoding UTF8
-    Copy-Item $exportFile $exportFileLatest -Force
-
-    $linksFile = Join-Path $TargetDir "xray2go_links_${timestamp}.txt"
-    $linksFileLatest = Join-Path $TargetDir 'xray2go_links_latest.txt'
-    $nonEmpty = $urlContent | Where-Object { $_.Trim() -ne '' }
-    $linksLines = @()
-    $linksLines += $nonEmpty
-    $linksLines += ''
-    $linksLines += '# Subscribe'
-    $linksLines += $subLink
-    $linksLines -join "`r`n" | Out-File -FilePath $linksFile -Encoding UTF8
-    Copy-Item $linksFile $linksFileLatest -Force
-
-    if ($Mode -eq 'auto') {
-        Write-Green 'Proxy info exported (auto):'
-    }
-    else {
-        Write-Green 'Proxy info exported:'
-    }
-    Write-Green "  Detail: $exportFile"
-    Write-Green "  Detail(latest): $exportFileLatest"
-    Write-Green "  Links: $linksFile"
-    Write-Green "  Links(latest): $linksFileLatest"
-}
-
-
-# ==========================================
-# 服务管理
-# ==========================================
-function Start-XraySvc {
-    $s = Check-Xray
-    if ($s -eq 1) {
-        Write-Yellow '正在启动 Xray 服务...'
-        & $NssmPath start xray 2>$null
-        Start-Sleep -Seconds 2
-        if ((Check-Xray) -eq 0) { Write-Green 'Xray 服务已启动' } else { Write-Red 'Xray 启动失败' }
-    }
-    elseif ($s -eq 0) { Write-Yellow 'Xray 正在运行' }
-    else { Write-Yellow 'Xray 尚未安装' }
-}
-
-function Stop-XraySvc {
-    $s = Check-Xray
-    if ($s -eq 0) {
-        Write-Yellow '正在停止 Xray 服务...'
-        & $NssmPath stop xray 2>$null
-        Write-Green 'Xray 服务已停止'
-    }
-    elseif ($s -eq 1) { Write-Yellow 'Xray 未运行' }
-    else { Write-Yellow 'Xray 尚未安装' }
-}
-
-function Restart-XraySvc {
-    $s = Check-Xray
-    if ($s -eq 0 -or $s -eq 1) {
-        Write-Yellow '正在重启 Xray 服务...'
-        & $NssmPath restart xray 2>$null
-        Start-Sleep -Seconds 2
-        if ((Check-Xray) -eq 0) { Write-Green 'Xray 已重启' } else { Write-Red 'Xray 重启失败' }
-    }
-    else { Write-Yellow 'Xray 尚未安装' }
-}
-
-function Start-ArgoSvc {
-    $s = Check-Argo
-    if ($s -eq 1) {
-        Write-Yellow '正在启动 Argo 服务...'
-        & $NssmPath start cloudflared-tunnel 2>$null
-        Write-Green 'Argo 已启动'
-    }
-    elseif ($s -eq 0) { Write-Green 'Argo 正在运行' }
-    else { Write-Yellow 'Argo 尚未安装' }
-}
-
-function Stop-ArgoSvc {
-    $s = Check-Argo
-    if ($s -eq 0) {
-        Write-Yellow '正在停止 Argo 服务...'
-        & $NssmPath stop cloudflared-tunnel 2>$null
-        Write-Green 'Argo 已停止'
-    }
-    elseif ($s -eq 1) { Write-Yellow 'Argo 未运行' }
-    else { Write-Yellow 'Argo 尚未安装' }
-}
-
-function Restart-ArgoSvc {
-    $s = Check-Argo
-    if ($s -eq 0 -or $s -eq 1) {
-        Write-Yellow '正在重启 Argo 服务...'
-        Remove-Item "$WorkDir\argo.log" -Force -ErrorAction SilentlyContinue
-        & $NssmPath restart cloudflared-tunnel 2>$null
-        Write-Green 'Argo 已重启'
-    }
-    else { Write-Yellow 'Argo 尚未安装' }
-}
-
-function Restart-CaddySvc {
-    if (Test-Path "$WorkDir\caddy.exe") {
-        Write-Yellow '正在重启 Caddy 服务...'
-        & $NssmPath restart caddy 2>$null
-        Write-Green 'Caddy 已重启'
-    }
-    else { Write-Yellow 'Caddy 尚未安装' }
-}
-
-# ==========================================
-# 卸载
-# ==========================================
-function Uninstall-Xray {
-    $choice = Read-Host '确定要卸载 xray-2go 吗? (y/n)'
-    if ($choice -eq 'y' -or $choice -eq 'Y') {
-        Write-Yellow '正在卸载...'
-        & $NssmPath stop xray 2>$null
-        & $NssmPath remove xray confirm 2>$null
-        & $NssmPath stop cloudflared-tunnel 2>$null
-        & $NssmPath remove cloudflared-tunnel confirm 2>$null
-        & $NssmPath stop caddy 2>$null
-        & $NssmPath remove caddy confirm 2>$null
-
-        Get-NetFirewallRule -DisplayName 'Xray2go_*' -ErrorAction SilentlyContinue |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
-
-        Remove-Item -Path $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Green 'Xray-2go 卸载成功'
-    }
-    else {
-        Write-Purple '已取消卸载'
-    }
-}
-
-# ==========================================
-# Argo 临时隧道
-# ==========================================
-function Get-QuickTunnel {
-    Restart-ArgoSvc
-    Write-Yellow '获取临时 Argo 域名中...'
-    Start-Sleep -Seconds 5
-
-    $argodomain = $null
-    for ($i = 1; $i -le 10; $i++) {
-        $argodomain = Get-ArgoDomain -LogFile "$WorkDir\argo.log"
-        if ($argodomain) { break }
-        Start-Sleep -Seconds 3
-    }
-
-    if ($argodomain) {
-        Write-Green "ArgoDomain: $argodomain"
-    }
-    else {
-        Write-Red 'Argo 域名获取失败'
-    }
-    $script:ArgoDomain = $argodomain
-}
-
-function Update-ArgoDomain {
-    if (-not $script:ArgoDomain) {
-        Write-Red 'Argo 域名为空'
-        return
-    }
-    Load-Ports
-
-    if (-not (Test-Path $ClientDir)) { return }
-
-    $content = Get-Content $ClientDir -Raw
-
-    # 替换 vless ws sni 和 host
-    $content = $content -replace 'sni=[a-zA-Z0-9-]*\.trycloudflare\.com', "sni=$($script:ArgoDomain)"
-    $content = $content -replace 'host=[a-zA-Z0-9-]*\.trycloudflare\.com', "host=$($script:ArgoDomain)"
-
-    # 替换 vmess
-    if ($content -match 'vmess://([A-Za-z0-9+/=]+)') {
-        try {
-            $decoded = ConvertFrom-Base64 -Text $matches[1]
-            $vmessObj = $decoded | ConvertFrom-Json
-            $vmessObj.host = $script:ArgoDomain
-            $vmessObj.sni = $script:ArgoDomain
-            $newJson = $vmessObj | ConvertTo-Json -Compress
-            $newB64 = ConvertTo-Base64 -Text $newJson
-            $content = $content -replace 'vmess://[A-Za-z0-9+/=]+', "vmess://$newB64"
-        }
-        catch {
-            Write-Yellow "VMess 更新失败: $($_.Exception.Message)"
-        }
-    }
-
-    $content | Out-File -FilePath $ClientDir -Encoding UTF8
-    $subB64 = ConvertTo-Base64 -Text $content
-    $subB64 | Out-File -FilePath "$WorkDir\sub.txt" -Encoding UTF8 -NoNewline
-
-    Write-Purple $content
-    Write-Green "`n节点已更新`n"
-}
-
-# ==========================================
-# 查看节点
-# ==========================================
-function Show-Nodes {
-    $s = Check-Xray
-    if ($s -eq 0) {
-        Load-Ports
-        Write-Host ''
-        Get-Content $ClientDir | ForEach-Object { Write-Purple $_ }
-        $serverIp = Get-RealIP
-        $info = Get-CaddyInfo
-        $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
-        Write-Host ''
-        Write-Green "Subscribe: $subLink"
-        Write-Host ''
-    }
-    else {
-        Write-Yellow 'Xray-2go not installed or not running'
-    }
-}
-
-# ==========================================
-# 修改配置
-# ==========================================
-function Change-Config {
-    Load-Ports
-    Clear-Host
-    Write-Host ''
-    Write-Green '1. 修改UUID'
-    Write-SkyBlue '------------'
-    Write-Green '2. 修改grpc-reality端口'
-    Write-SkyBlue '------------'
-    Write-Green '3. 修改xhttp-reality端口'
-    Write-SkyBlue '------------'
-    Write-Purple '0. 返回主菜单'
-    Write-SkyBlue '------------'
-
-    $choice = Read-Host '请输入选择'
-    switch ($choice) {
-        '1' {
-            $newUuid = Read-Host '请输入新的UUID (回车自动生成)'
-            if (-not $newUuid) {
-                $newUuid = New-UUID
-                Write-Green "生成的UUID：$newUuid"
-            }
-            $cfg = Get-Content $ConfigDir -Raw
-            $cfg = $cfg -replace '[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}', $newUuid
-            $cfg | Out-File -FilePath $ConfigDir -Encoding UTF8
-            $pe = Get-Content $PortsEnvFile -Raw
-            $pe = $pe -replace 'UUID=.*', "UUID=$newUuid"
-            $pe | Out-File -FilePath $PortsEnvFile -Encoding UTF8
-            Restart-XraySvc
-            Write-Green "UUID已修改为：$newUuid"
-        }
-        '2' {
-            $newPort = Read-Host '请输入grpc-reality端口 (回车自动分配)'
-            if (-not $newPort) { $newPort = Find-AvailablePort -StartPort 2000 -EndPort 65000 }
-            $cfg = Get-Content $ConfigDir -Raw | ConvertFrom-Json
-            $cfg.inbounds[5].port = [int]$newPort
-            $cfg | ConvertTo-Json -Depth 20 | Out-File -FilePath $ConfigDir -Encoding UTF8
-            $pe = (Get-Content $PortsEnvFile) -replace 'GRPC_PORT=.*', "GRPC_PORT=$newPort"
-            $pe | Out-File $PortsEnvFile -Encoding UTF8
-            Restart-XraySvc
-            Write-Green "GRPC端口已修改为：$newPort"
-        }
-        '3' {
-            $newPort = Read-Host '请输入xhttp-reality端口 (回车自动分配)'
-            if (-not $newPort) { $newPort = Find-AvailablePort -StartPort 2000 -EndPort 65000 }
-            $cfg = Get-Content $ConfigDir -Raw | ConvertFrom-Json
-            $cfg.inbounds[4].port = [int]$newPort
-            $cfg | ConvertTo-Json -Depth 20 | Out-File -FilePath $ConfigDir -Encoding UTF8
-            $pe = (Get-Content $PortsEnvFile) -replace 'XHTTP_PORT=.*', "XHTTP_PORT=$newPort"
-            $pe | Out-File $PortsEnvFile -Encoding UTF8
-            Restart-XraySvc
-            Write-Green "XHTTP端口已修改为：$newPort"
-        }
-        '0' { return }
-        default { Write-Red '无效选项' }
-    }
-}
-
-# ==========================================
-# 管理订阅
-# ==========================================
-function Manage-Subscription {
-    $s = Check-Xray
-    if ($s -ne 0) {
-        Write-Yellow 'Xray-2go not installed or not running'
-        return
-    }
-    $caddyFilePath = Join-Path $WorkDir 'Caddyfile'
-    Clear-Host
-    Write-Host ''
-    Write-Green '1. Stop subscription'
-    Write-Green '2. Start subscription (new password)'
-    Write-Green '3. Change subscription port'
-    Write-Purple '4. Back'
-
-    $choice = Read-Host 'Select'
-    switch ($choice) {
-        '1' {
-            & $NssmPath stop caddy 2>$null
-            Write-Green 'Subscription stopped'
-        }
-        '2' {
-            $newPw = New-Password -Length 32
-            if (Test-Path $caddyFilePath) {
-                $cc = Get-Content $caddyFilePath -Raw
-                $cc = $cc -replace 'handle /\w+', "handle /$newPw"
-                $cc | Out-File -FilePath $caddyFilePath -Encoding UTF8
-            }
-            Restart-CaddySvc
-            $serverIp = Get-RealIP
-            $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$newPw"
-            Write-Green "New subscribe link: $subLink"
-        }
-        '3' {
-            $newPort = Read-Host 'New port (1-65535, Enter=auto)'
-            if (-not $newPort) { $newPort = Find-AvailablePort -StartPort 2000 -EndPort 65000 }
-            if (Test-Path $caddyFilePath) {
-                $cc = Get-Content $caddyFilePath -Raw
-                $cc = $cc -replace ':\d+\s*\{', ":$newPort {"
-                $cc | Out-File -FilePath $caddyFilePath -Encoding UTF8
-            }
-            if (Test-Path $PortsEnvFile) {
-                $pe = (Get-Content $PortsEnvFile) -replace 'PORT=.*', "PORT=$newPort"
-                $pe | Out-File -FilePath $PortsEnvFile -Encoding UTF8
-            }
-            Restart-CaddySvc
-            $serverIp = Get-RealIP
-            $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:${newPort}/$($info.Path)"
-            Write-Green "New subscribe link: $subLink"
-        }
-        '4' { return }
-        default { Write-Red 'Invalid' }
-    }
-}
-# ==========================================
-# Xray 管理菜单
-# ==========================================
-function Manage-XrayMenu {
-    Write-Green '1. 启动xray服务'
-    Write-Green '2. 停止xray服务'
-    Write-Green '3. 重启xray服务'
-    Write-Purple '4. 返回主菜单'
-
-    $choice = Read-Host '请输入选择'
-    switch ($choice) {
-        '1' { Start-XraySvc }
-        '2' { Stop-XraySvc }
-        '3' { Restart-XraySvc }
-        '4' { return }
-        default { Write-Red '无效选项' }
-    }
-}
-
-# ==========================================
-# Argo 管理菜单
-# ==========================================
-function Manage-ArgoMenu {
-    $s = Check-Argo
-    if ($s -eq 2) {
-        Write-Yellow 'Argo 尚未安装'
-        return
-    }
-    Load-Ports
-    Clear-Host
-    Write-Host ''
-    Write-Green '1. 启动Argo服务'
-    Write-Green '2. 停止Argo服务'
-    Write-Green '3. 添加Argo固定隧道'
-    Write-Green '4. 切换回Argo临时隧道'
-    Write-Green '5. 重新获取Argo临时域名'
-    Write-Purple '6. 返回主菜单'
-
-    $choice = Read-Host '请输入选择'
-    switch ($choice) {
-        '1' { Start-ArgoSvc }
-        '2' { Stop-ArgoSvc }
-        '3' {
-            Clear-Host
-            Write-Yellow "固定隧道端口为 $($script:ARGO_PORT)"
-            $argoDomain = Read-Host '请输入你的argo域名'
-            $script:ArgoDomain = $argoDomain
-            $argoAuth = Read-Host '请输入你的argo密钥(token)'
-            if ($argoAuth -match '^[A-Z0-9a-z=]{120,250}$') {
-                & $NssmPath stop cloudflared-tunnel 2>$null
-                & $NssmPath remove cloudflared-tunnel confirm 2>$null
-                $tokenArgs = "tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argoAuth"
-                & $NssmPath install cloudflared-tunnel "$WorkDir\argo.exe" $tokenArgs
-                & $NssmPath set cloudflared-tunnel AppDirectory "$WorkDir"
-                & $NssmPath set cloudflared-tunnel AppStdout "$WorkDir\argo.log"
-                & $NssmPath set cloudflared-tunnel AppStderr "$WorkDir\argo.log"
-                & $NssmPath start cloudflared-tunnel
-                Update-ArgoDomain
-            }
-            else {
-                Write-Yellow 'token 格式不匹配'
-            }
-        }
-        '4' {
-            & $NssmPath stop cloudflared-tunnel 2>$null
-            & $NssmPath remove cloudflared-tunnel confirm 2>$null
-            $tmpArgs = "tunnel --url http://localhost:$($script:ARGO_PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
-            & $NssmPath install cloudflared-tunnel "$WorkDir\argo.exe" $tmpArgs
-            & $NssmPath set cloudflared-tunnel AppDirectory "$WorkDir"
-            & $NssmPath set cloudflared-tunnel AppStdout "$WorkDir\argo.log"
-            & $NssmPath set cloudflared-tunnel AppStderr "$WorkDir\argo.log"
-            & $NssmPath start cloudflared-tunnel
-            Get-QuickTunnel
-            Update-ArgoDomain
-        }
-        '5' {
-            Get-QuickTunnel
-            Update-ArgoDomain
-        }
-        '6' { return }
-        default { Write-Red '无效选项' }
-    }
-}
-
-# ==========================================
-# 导出菜单
-# ==========================================
-function Show-ExportMenu {
-    $s = Check-Xray
-    if (($s -ne 0) -and (-not (Test-Path $ClientDir))) {
-        Write-Yellow 'Xray-2go not installed'
-        return
-    }
-
-    Clear-Host
-    Write-Host ''
-    Write-Green '1. Export to current directory'
-    Write-Green '2. Export to custom path'
-    Write-Green '3. Show all node links'
-    Write-Green '4. Copy subscribe link to clipboard'
-    Write-Purple '5. Back'
-
-    $choice = Read-Host 'Select'
-    switch ($choice) {
-        '1' { Export-ProxyTxt -Mode 'manual' }
-        '2' {
-            $customPath = Read-Host 'Export path'
-            if (-not $customPath) { $customPath = $ExportDir }
-            if (-not (Test-Path $customPath)) {
-                New-Item -ItemType Directory -Path $customPath -Force | Out-Null
-            }
-            Export-ProxyTxt -Mode 'manual' -TargetDir $customPath
-        }
-        '3' {
-            Load-Ports
-            Write-Host ''
-            Write-Green '========== Node Links =========='
-            Get-Content $ClientDir | Where-Object { $_.Trim() -ne '' } | ForEach-Object { Write-Purple $_ }
-            $serverIp = Get-RealIP
-            $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
-            Write-Host ''
-            Write-Green '========== Subscribe =========='
-            Write-Green $subLink
-            Write-Green '================================'
-        }
-        '4' {
-            Load-Ports
-            $serverIp = Get-RealIP
-            $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
-            Set-Clipboard -Value $subLink
-            Write-Green "Copied: $subLink"
-        }
-        '5' { return }
-        default { Write-Red 'Invalid' }
-    }
-}
-
-
-# ==========================================
-# 主菜单
-# ==========================================
-function Show-Menu {
-    while ($true) {
-        $xrayStatus = Check-Xray
-        $argoStatus = Check-Argo
-        $caddyStatus = Check-Caddy
-
-        Clear-Host
-        Write-Host ''
-        Write-Purple "=== Xray-2go (Windows) ===`n"
-        Write-Purple " Xray:  $(Get-StatusText $xrayStatus)"
-        Write-Purple " Argo:  $(Get-StatusText $argoStatus)"
-        Write-Purple " Caddy: $(Get-StatusText $caddyStatus)`n"
-        Write-Green  '1. 安装Xray-2go'
-        Write-Red    '2. 卸载Xray-2go'
-        Write-Host   '==============='
-        Write-Green  '3. Xray-2go管理'
-        Write-Green  '4. Argo隧道管理'
-        Write-Host   '==============='
-        Write-Green  '5. 查看节点信息'
-        Write-Green  '6. 修改节点配置'
-        Write-Green  '7. 管理节点订阅'
-        Write-Host   '==============='
-        Write-SkyBlue '8. 导出代理为txt'
-        Write-Host   '==============='
-        Write-Red    '0. 退出脚本'
-        Write-Host   '==========='
-
-        $choice = Read-Host '请输入选择(0-8)'
-        Write-Host ''
-
-        switch ($choice) {
-            '1' {
-                if ($xrayStatus -eq 0) {
-                    Write-Yellow 'Xray-2go 已经安装！'
-                }
-                else {
-                    Install-NSSM
-                    Install-Caddy
-                    Install-Jq
-                    Install-Xray
-                    Install-Services
-                    Start-Sleep -Seconds 3
-                    Get-Info
-                    Install-CaddyService
-                }
-            }
-            '2' { Uninstall-Xray }
-            '3' { Manage-XrayMenu }
-            '4' { Manage-ArgoMenu }
-            '5' { Show-Nodes }
-            '6' { Change-Config }
-            '7' { Manage-Subscription }
-            '8' { Show-ExportMenu }
-            '0' { exit 0 }
-            default { Write-Red '无效选项，请输入 0 到 8' }
-        }
-
-        Write-Host ''
-        Write-Host -NoNewline -ForegroundColor Red '按任意键继续...'
-        $null = $Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
-    }
-}
-
-# 入口
-Show-Menu
-
+# ============================================================
+# Cloudflare 固定隧道
+# ============================================================
 function Setup-FixedTunnel {
-    Write-Host "配置 Cloudflare 固定隧道..."
+    Write-Step "配置 Cloudflare 固定隧道"
+
+    # 读取 .env
+    if (Test-Path $DOT_ENV) {
+        Get-Content $DOT_ENV | ForEach-Object {
+            if ($_ -match '^([^#=]+)=(.+)$') {
+                Set-Variable -Name $Matches[1].Trim() -Value $Matches[2].Trim() -Scope Script
+            }
+        }
+    }
+
+    if (-not (Get-Variable -Name "CF_API_TOKEN" -Scope Script -ErrorAction SilentlyContinue).Value) {
+        $script:CF_API_TOKEN = Read-Host "CF_API_TOKEN"
+        if (-not $script:CF_API_TOKEN) { Die "CF_API_TOKEN 不能为空" }
+    }
+    if (-not (Get-Variable -Name "CF_ACCOUNT_ID" -Scope Script -ErrorAction SilentlyContinue).Value) {
+        $script:CF_ACCOUNT_ID = Read-Host "CF_ACCOUNT_ID"
+        if (-not $script:CF_ACCOUNT_ID) { Die "CF_ACCOUNT_ID 不能为空" }
+    }
+
+    $tunnelName   = "xray-$(hostname)-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    $API_BASE     = "https://api.cloudflare.com/client/v4"
+    $headers      = @{
+        "Authorization" = "Bearer $($script:CF_API_TOKEN)"
+        "Content-Type"  = "application/json"
+    }
+
+    # 生成 tunnel_secret
+    $secretBytes = New-Object byte[] 32
+    [Security.Cryptography.RandomNumberGenerator]::Fill($secretBytes)
+    $tunnelSecret = [Convert]::ToBase64String($secretBytes)
+
+    # 创建隧道
+    Write-Info "创建隧道: $tunnelName"
+    $body = @{name=$tunnelName; tunnel_secret=$tunnelSecret} | ConvertTo-Json
+    $resp = Invoke-RestMethod -Uri "$API_BASE/accounts/$($script:CF_ACCOUNT_ID)/cfd_tunnel" `
+        -Method POST -Headers $headers -Body $body -ErrorAction Stop
+
+    if (-not $resp.success) { Die "创建隧道失败: $($resp.errors | ConvertTo-Json)" }
+
+    $tunnelId = $resp.result.id
+    Write-Info "隧道 ID: $tunnelId"
+
+    # 读取环境变量
+    $envData  = Load-Env
+    $argoPort = $envData["ARGO_PORT"]
+
+    # 配置入站
+    $ingress = if ($envData["CF_TUNNEL_DOMAIN"]) {
+        @(
+            @{hostname=$envData["CF_TUNNEL_DOMAIN"]; service="http://localhost:$argoPort"; originRequest=@{}},
+            @{service="http_status:404"}
+        )
+    } else {
+        @(@{service="http://localhost:$argoPort"})
+    }
+    $cfgBody = @{config=@{originRequest=@{}; "warp-routing"=@{enabled=$false}; ingress=$ingress}} |
+        ConvertTo-Json -Depth 10
+    Invoke-RestMethod -Uri "$API_BASE/accounts/$($script:CF_ACCOUNT_ID)/cfd_tunnel/$tunnelId/configurations" `
+        -Method PUT -Headers $headers -Body $cfgBody -ErrorAction Stop | Out-Null
+
+    # 获取 token
+    $tokenResp = Invoke-RestMethod `
+        -Uri "$API_BASE/accounts/$($script:CF_ACCOUNT_ID)/cfd_tunnel/$tunnelId/token" `
+        -Method GET -Headers $headers -ErrorAction Stop
+
+    $tunnelToken = $tokenResp.result
+    if (-not $tunnelToken) { Die "获取 Token 失败" }
+
+    # DNS CNAME（可选）
+    $cfDomain = $envData["CF_TUNNEL_DOMAIN"]
+    $cfZone   = if (Test-Path $DOT_ENV) {
+        (Get-Content $DOT_ENV | Where-Object { $_ -match "^CF_ZONE_ID=(.+)$" } |
+         Select-Object -First 1) -replace "^CF_ZONE_ID=", ""
+    } else { "" }
+
+    if ($cfDomain -and $cfZone) {
+        $dnsBody = @{
+            type="CNAME"; name=$cfDomain
+            content="$tunnelId.cfargotunnel.com"; proxied=$true
+        } | ConvertTo-Json
+        try {
+            Invoke-RestMethod -Uri "$API_BASE/zones/$cfZone/dns_records" `
+                -Method POST -Headers $headers -Body $dnsBody | Out-Null
+            Write-Info "DNS CNAME 已创建"
+        } catch {
+            Write-Warn "DNS CNAME 创建失败（可能已存在）"
+        }
+    }
+
+    # 保存
+    $argoDomain = if ($cfDomain) { $cfDomain } else { "$tunnelId.cfargotunnel.com" }
+    Update-EnvKey "CF_TUNNEL_TOKEN" $tunnelToken
+    Update-EnvKey "CF_TUNNEL_ID"    $tunnelId
+    Update-EnvKey "CF_TUNNEL_NAME"  $tunnelName
+    Update-EnvKey "ARGO_DOMAIN"     $argoDomain
+
+    @"
+CF_API_TOKEN=$($script:CF_API_TOKEN)
+CF_ACCOUNT_ID=$($script:CF_ACCOUNT_ID)
+CF_ZONE_ID=$cfZone
+CF_TUNNEL_NAME=$tunnelName
+"@ | Set-Content $DOT_ENV -Encoding UTF8
+
+    # 重启 tunnel 进程
+    Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "*$INSTALL_DIR*" } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+
+    $envData = Load-Env
+    Start-TunnelProcess -Env $envData | Out-Null
+
+    # 重新生成启动脚本（含新 token）
+    Generate-BootScript
+    Generate-WatchdogScript
+
+    Write-Info "固定隧道配置完成: $argoDomain"
 }
+
 function Delete-FixedTunnel {
-    Write-Host "删除固定隧道..."
+    Write-Step "删除固定隧道"
+
+    if (Test-Path $DOT_ENV) {
+        Get-Content $DOT_ENV | ForEach-Object {
+            if ($_ -match '^([^#=]+)=(.+)$') {
+                Set-Variable -Name $Matches[1].Trim() -Value $Matches[2].Trim() -Scope Script
+            }
+        }
+    }
+
+    $envData   = Load-Env
+    $tunnelId  = $envData["CF_TUNNEL_ID"]
+    $apiToken  = (Get-Variable "CF_API_TOKEN" -Scope Script -EA SilentlyContinue).Value
+    $accountId = (Get-Variable "CF_ACCOUNT_ID" -Scope Script -EA SilentlyContinue).Value
+
+    if (-not $tunnelId -or -not $apiToken -or -not $accountId) {
+        Die "缺少 CF_TUNNEL_ID / CF_API_TOKEN / CF_ACCOUNT_ID"
+    }
+
+    $API_BASE = "https://api.cloudflare.com/client/v4"
+    $headers  = @{
+        "Authorization" = "Bearer $apiToken"
+        "Content-Type"  = "application/json"
+    }
+
+    # 停止进程
+    Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like "*$INSTALL_DIR*" } |
+        Stop-Process -Force -ErrorAction SilentlyContinue
+
+    # 清理连接
+    try {
+        Invoke-RestMethod `
+            -Uri "$API_BASE/accounts/$accountId/cfd_tunnel/$tunnelId/connections" `
+            -Method DELETE -Headers $headers | Out-Null
+        Start-Sleep -Seconds 2
+    } catch {}
+
+    # 删除隧道
+    $resp = Invoke-RestMethod `
+        -Uri "$API_BASE/accounts/$accountId/cfd_tunnel/$tunnelId" `
+        -Method DELETE -Headers $headers
+
+    if ($resp.success) {
+        Update-EnvKey "CF_TUNNEL_TOKEN" ""
+        Update-EnvKey "CF_TUNNEL_ID"    ""
+        Update-EnvKey "ARGO_DOMAIN"     ""
+        Write-Info "固定隧道已删除"
+    } else {
+        Write-Err "删除失败: $($resp.errors | ConvertTo-Json)"
+    }
+}
+
+# ============================================================
+# 节点信息
+# ============================================================
+function Print-NodeInfo {
+    $envData    = Load-Env
+    $IP         = Get-PublicIP
+    $argoDomain = Get-ArgoDomain -Env $envData
+    $N          = $IP
+
+    Write-Host ""
+    Write-Host "╔══════════════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "║      Xray-2go Windows 节点信息           ║" -ForegroundColor Cyan
+    Write-Host "╠══════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║  时间:   $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')           ║" -ForegroundColor White
+    Write-Host "║  系统:   Windows $(Get-WinVersion) ($(Get-Arch))         ║" -ForegroundColor White
+    Write-Host "║  服务器: $IP" -ForegroundColor White
+    Write-Host "╠══════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║  端口: 订阅=$($envData['SUB_PORT'])  Argo=$($envData['ARGO_PORT'])  GRPC=$($envData['GRPC_PORT'])" -ForegroundColor White
+    Write-Host "║        XHTTP=$($envData['XHTTP_PORT'])  Vision=$($envData['VISION_PORT'])  SS=$($envData['SS_PORT'])  H3=$($envData['XHTTP_H3_PORT'])" -ForegroundColor White
+    Write-Host "╠══════════════════════════════════════════╣" -ForegroundColor Cyan
+    Write-Host "║  UUID: $($envData['UUID'])" -ForegroundColor White
+    Write-Host "║  PubKey: $($envData['public_key'])" -ForegroundColor White
+    Write-Host "║  Argo: $(if($argoDomain){$argoDomain}else{'未获取'})" -ForegroundColor White
+    Write-Host "╚══════════════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "===========================================" -ForegroundColor Yellow
+    Write-Host "  节点链接" -ForegroundColor Yellow
+    Write-Host "===========================================" -ForegroundColor Yellow
+    Write-Host ""
+
+    $uuid    = $envData['UUID']
+    $pk      = $envData['public_key']
+    $ssp     = $envData['ss_password']
+    $tp      = $envData['trojan_password']
+    $cdn     = $CDN_HOST
+
+    Write-Host "--- 1. VLESS TCP Vision Reality ---" -ForegroundColor Green
+    Write-Host "vless://${uuid}@${IP}:$($envData['VISION_PORT'])?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${pk}&type=tcp#${N}-Vision-Reality"
+    Write-Host ""
+
+    Write-Host "--- 2. VLESS XHTTP Reality ---" -ForegroundColor Green
+    Write-Host "vless://${uuid}@${IP}:$($envData['XHTTP_PORT'])?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${pk}&allowInsecure=1&type=xhttp&mode=auto#${N}-XHTTP-Reality"
+    Write-Host ""
+
+    Write-Host "--- 3. VLESS gRPC Reality ---" -ForegroundColor Green
+    Write-Host "vless://${uuid}@${IP}:$($envData['GRPC_PORT'])?encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${pk}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${N}-gRPC-Reality"
+    Write-Host ""
+
+    Write-Host "--- 4. VLESS XHTTP H3 Reality ---" -ForegroundColor Green
+    Write-Host "vless://${uuid}@${IP}:$($envData['XHTTP_H3_PORT'])?encryption=none&security=reality&sni=www.apple.com&fp=chrome&pbk=${pk}&allowInsecure=1&type=xhttp&mode=auto#${N}-XHTTP-H3-Reality"
+    Write-Host ""
+
+    Write-Host "--- 5. Shadowsocks 2022 ---" -ForegroundColor Green
+    $ssBytes = [Text.Encoding]::UTF8.GetBytes("2022-blake3-aes-128-gcm:$ssp")
+    $ssB64   = [Convert]::ToBase64String($ssBytes)
+    Write-Host "ss://${ssB64}@${IP}:$($envData['SS_PORT'])#${N}-SS2022"
+    Write-Host ""
+
+    if ($argoDomain) {
+        Write-Host "--- 6. VLESS WS Argo ---" -ForegroundColor Green
+        Write-Host "vless://${uuid}@${cdn}:443?encryption=none&security=tls&sni=${argoDomain}&fp=chrome&type=ws&host=${argoDomain}&path=%2Fvless-argo%3Fed%3D2560#${N}-VLESS-WS-Argo"
+        Write-Host ""
+
+        Write-Host "--- 7. VMess WS Argo ---" -ForegroundColor Green
+        $vmessObj = @{
+            v="2"; ps="${N}-VMess-WS-Argo"; add=$cdn
+            port="443"; id=$uuid; aid="0"; scy="none"
+            net="ws"; type="none"; host=$argoDomain
+            path="/vmess-argo?ed=2560"; tls="tls"
+            sni=$argoDomain; alpn=""; fp="chrome"
+        }
+        $vmessJson = $vmessObj | ConvertTo-Json -Compress
+        $vmessB64  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($vmessJson))
+        Write-Host "vmess://$vmessB64"
+        Write-Host ""
+
+        Write-Host "--- 8. Trojan WS Argo ---" -ForegroundColor Green
+        Write-Host "trojan://${tp}@${cdn}:443?security=tls&sni=${argoDomain}&fp=chrome&type=ws&host=${argoDomain}&path=%2Ftrojan-argo%3Fed%3D2560#${N}-Trojan-WS-Argo"
+        Write-Host ""
+    }
+
+    Write-Host "===========================================" -ForegroundColor Yellow
+    Write-Host "  订阅链接" -ForegroundColor Yellow
+    Write-Host "===========================================" -ForegroundColor Yellow
+    Write-Host "http://${IP}:$($envData['SUB_PORT'])/$($envData['SUB_TOKEN'])"
+    Write-Host ""
+}
+
+# ============================================================
+# 状态查看
+# ============================================================
+function Show-Status {
+    Write-Host "`n=== 进程状态 ===" -ForegroundColor Cyan
+    @("xray", "cloudflared") | ForEach-Object {
+        $proc = Get-Process -Name $_ -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -like "*$INSTALL_DIR*" }
+        if ($proc) {
+            Write-Host "  $_ : ✅ 运行中 (PID=$($proc.Id))" -ForegroundColor Green
+        } else {
+            Write-Host "  $_ : ❌ 未运行" -ForegroundColor Red
+        }
+    }
+
+    Write-Host "`n=== 计划任务 ===" -ForegroundColor Cyan
+    @("Xray2goBoot", "Xray2goWatchdog") | ForEach-Object {
+        $task = Get-ScheduledTask -TaskName $_ -ErrorAction SilentlyContinue
+        if ($task) {
+            Write-Host "  $_ : ✅ $($task.State)" -ForegroundColor Green
+        } else {
+            Write-Host "  $_ : ❌ 不存在" -ForegroundColor Red
+        }
+    }
+
+    Write-Host "`n=== 注册表启动项 ===" -ForegroundColor Cyan
+    $reg = Get-ItemProperty `
+        -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+        -Name "Xray2go" -ErrorAction SilentlyContinue
+    if ($reg) {
+        Write-Host "  Xray2go : ✅ 存在" -ForegroundColor Green
+    } else {
+        Write-Host "  Xray2go : ❌ 不存在" -ForegroundColor Red
+    }
+
+    Write-Host "`n=== 端口监听 ===" -ForegroundColor Cyan
+    $envData = Load-Env
+    @("ARGO_PORT","VISION_PORT","SS_PORT","SUB_PORT") | ForEach-Object {
+        $port = $envData[$_]
+        if ($port) {
+            $conn = Get-NetTCPConnection -LocalPort $port -State Listen `
+                -ErrorAction SilentlyContinue
+            if ($conn) {
+                Write-Host "  :$port ($_ ) : ✅ 监听中" -ForegroundColor Green
+            } else {
+                Write-Host "  :$port ($_ ) : ❌ 未监听" -ForegroundColor Red
+            }
+        }
+    }
+    Write-Host ""
+}
+
+# ============================================================
+# 完整安装
+# ============================================================
+function Do-Install {
+    Write-Step "==== Xray-2go Windows 安装开始 ===="
+    Write-Info "安装目录: $INSTALL_DIR"
+    Write-Info "Windows $(Get-WinVersion) | 架构: $(Get-Arch)"
+    Write-Info "管理员: $(Test-IsAdmin)"
+
+    # 创建目录
+    New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
+    New-Item -ItemType Directory -Force -Path $LOG_DIR     | Out-Null
+
+    Generate-Ports
+    Download-Xray
+    Download-Argo
+    Generate-Keys
+    Save-PortsEnv
+    Generate-Config
+    Generate-SubServer
+    Generate-WatchdogScript
+    Generate-BootScript
+    Setup-Persist
+
+    # 启动服务
+    Write-Step "启动服务"
+    Wait-Network
+    $envData = Load-Env
+    Start-XrayProcess  -Env $envData | Out-Null
+    Start-Sleep -Seconds 2
+    Start-TunnelProcess -Env $envData | Out-Null
+    Start-SubProcess    -Env $envData
+
+    # 等待 Argo 域名
+    Write-Info "等待 Argo 域名 (最多 40 秒)..."
+    $domain = ""
+    for ($i = 1; $i -le 20; $i++) {
+        $logFile = Join-Path $LOG_DIR "argo.log"
+        if (Test-Path $logFile) {
+            $match = Select-String -Path $logFile `
+                -Pattern "([a-z0-9\-]+\.trycloudflare\.com)" |
+                Select-Object -Last 1
+            if ($match) {
+                $domain = $match.Matches[0].Groups[1].Value
+                break
+            }
+        }
+        Start-Sleep -Seconds 2
+    }
+
+    if ($domain) {
+        Update-EnvKey "ARGO_DOMAIN" $domain
+        Write-Info "Argo 域名: $domain"
+    } else {
+        Write-Warn "未获取到域名，可稍后通过菜单选项3查看"
+    }
+
+    Print-NodeInfo
+    Write-Step "==== 安装完成 ===="
+}
+
+# ============================================================
+# 完整卸载
+# ============================================================
+function Do-Uninstall {
+    Write-Step "开始卸载..."
+
+    # 停止进程
+    Stop-AllProcesses
+
+    # 删除计划任务
+    @("Xray2goBoot", "Xray2goWatchdog") | ForEach-Object {
+        Unregister-ScheduledTask -TaskName $_ -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Info "已删除计划任务: $_"
+    }
+
+    # 删除 Startup 快捷方式
+    $startupDir = [IO.Path]::Combine(
+        $env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
+    $lnk = Join-Path $startupDir "Xray2go.lnk"
+    if (Test-Path $lnk) { Remove-Item $lnk -Force }
+
+    # 删除注册表
+    Remove-ItemProperty `
+        -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" `
+        -Name "Xray2go" -ErrorAction SilentlyContinue
+
+    # 取消隐藏
+    if (Test-Path $INSTALL_DIR -ErrorAction SilentlyContinue) {
+        $dirInfo = Get-Item $INSTALL_DIR -Force -ErrorAction SilentlyContinue
+        if ($dirInfo) {
+            $dirInfo.Attributes = $dirInfo.Attributes -band (
+                -bnot [IO.FileAttributes]::Hidden)
+        }
+        Remove-Item $INSTALL_DIR -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host ""
+    Write-Host "  🧹 Windows 卸载完成" -ForegroundColor Green
+    Write-Host "  所有计划任务 / 注册表 / Startup / 安装目录 已清除" -ForegroundColor Green
+    Write-Host ""
+}
+
+# ============================================================
+# 菜单
+# ============================================================
+function Show-Menu {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ╔══════════════════════════════════╗" -ForegroundColor Cyan
+    Write-Host "  ║   Xray-2go Windows v$SCRIPT_VERSION         ║" -ForegroundColor Cyan
+    Write-Host "  ║   $(Get-WinVersion) | $(Get-Arch)               ║" -ForegroundColor Cyan
+    Write-Host "  ╚══════════════════════════════════╝" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "  1) 安装" -ForegroundColor White
+    Write-Host "  2) 卸载" -ForegroundColor White
+    Write-Host "  3) 显示节点信息" -ForegroundColor White
+    Write-Host "  4) 重启所有服务" -ForegroundColor White
+    Write-Host "  5) 查看状态" -ForegroundColor White
+    Write-Host "  6) 配置 CF 固定隧道" -ForegroundColor White
+    Write-Host "  7) 删除 CF 固定隧道" -ForegroundColor White
+    Write-Host "  8) 切换回临时隧道" -ForegroundColor White
+    Write-Host "  9) 更新 Xray" -ForegroundColor White
+    Write-Host "  0) 退出" -ForegroundColor White
+    Write-Host ""
+    $choice = Read-Host "  请选择"
+
+    switch ($choice) {
+        "1" { Do-Install }
+        "2" {
+            $confirm = Read-Host "  确认卸载? [y/N]"
+            if ($confirm -match "^[Yy]$") { Do-Uninstall } else { Write-Info "已取消" }
+        }
+        "3" {
+            if (Test-Path $PORTS_ENV) { Print-NodeInfo } else { Write-Warn "未安装" }
+        }
+        "4" {
+            Write-Info "重启所有服务..."
+            Stop-AllProcesses
+            Start-Sleep -Seconds 1
+            $envData = Load-Env
+            Start-XrayProcess   -Env $envData | Out-Null
+            Start-Sleep -Seconds 2
+            Start-TunnelProcess -Env $envData | Out-Null
+            Start-SubProcess    -Env $envData
+            Write-Info "重启完成"
+        }
+        "5" { Show-Status }
+        "6" { Setup-FixedTunnel }
+        "7" { Delete-FixedTunnel }
+        "8" {
+            Write-Info "切换回临时隧道..."
+            Update-EnvKey "CF_TUNNEL_TOKEN" ""
+            Update-EnvKey "CF_TUNNEL_ID"    ""
+            Update-EnvKey "ARGO_DOMAIN"     ""
+            # 重启 tunnel
+            Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -like "*$INSTALL_DIR*" } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            Remove-Item (Join-Path $LOG_DIR "argo.log") -ErrorAction SilentlyContinue
+            Generate-BootScript
+            $envData = Load-Env
+            Start-TunnelProcess -Env $envData | Out-Null
+            Write-Info "等待临时域名..."
+            Start-Sleep -Seconds 10
+            $envData  = Load-Env
+            $logFile  = Join-Path $LOG_DIR "argo.log"
+            if (Test-Path $logFile) {
+                $match = Select-String -Path $logFile `
+                    -Pattern "([a-z0-9\-]+\.trycloudflare\.com)" |
+                    Select-Object -Last 1
+                if ($match) {
+                    $domain = $match.Matches[0].Groups[1].Value
+                    Update-EnvKey "ARGO_DOMAIN" $domain
+                    Write-Info "新域名: $domain"
+                }
+            }
+        }
+        "9" {
+            Write-Info "更新 Xray..."
+            Get-Process -Name "xray" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -like "*$INSTALL_DIR*" } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+            Download-Xray
+            $envData = Load-Env
+            Start-XrayProcess -Env $envData | Out-Null
+            Write-Info "Xray 已更新并重启"
+        }
+        "0" { exit 0 }
+        default { Write-Warn "无效选择" }
+    }
+
+    Write-Host ""
+    Read-Host "  按 Enter 返回菜单"
+    Show-Menu
+}
+
+# ============================================================
+# 入口
+# ============================================================
+switch ($args[0]) {
+    "install"   { Do-Install }
+    "uninstall" { Do-Uninstall }
+    "info"      { if (Test-Path $PORTS_ENV) { Print-NodeInfo } else { Write-Warn "未安装" } }
+    "status"    { Show-Status }
+    "restart"   {
+        Stop-AllProcesses
+        Start-Sleep -Seconds 1
+        $envData = Load-Env
+        Start-XrayProcess   -Env $envData | Out-Null
+        Start-Sleep -Seconds 2
+        Start-TunnelProcess -Env $envData | Out-Null
+        Start-SubProcess    -Env $envData
+    }
+    default     { Show-Menu }
 }
