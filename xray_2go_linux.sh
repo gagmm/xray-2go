@@ -997,10 +997,10 @@ fi
 # cron 自愈（仅在 crontab 可用时）
 if command -v crontab &>/dev/null; then
     if ! crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
-        (crontab -l 2>/dev/null; echo "* * * * * \${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab - 2>/dev/null || true
+        (crontab -l 2>/dev/null; echo "* * * * * \${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab - 2>/dev/null 2>/dev/null || true
     fi
     if ! crontab -l 2>/dev/null | grep -q "xray-boot.sh"; then
-        (crontab -l 2>/dev/null; echo "@reboot sleep 10 && \${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab - 2>/dev/null || true
+        (crontab -l 2>/dev/null; echo "@reboot sleep 10 && \${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab - 2>/dev/null 2>/dev/null || true
     fi
 fi
 
@@ -1071,7 +1071,7 @@ BOOTEOF
             new_cron="${new_cron}"$'\n'"0 */6 * * * ${INSTALL_DIR}/log-clean.sh >/dev/null 2>&1"
         fi
 
-        echo "$new_cron" | grep -v '^[[:space:]]*$' | crontab - 2>/dev/null || true
+        echo "$new_cron" | grep -v '^[[:space:]]*$' | crontab - 2>/dev/null 2>/dev/null || true
         log "INFO" "crontab 已配置"
     else
         log "WARN" "crontab 不可用，跳过 cron 持久化"
@@ -1178,10 +1178,12 @@ done
 LCEOF
     chmod +x "${INSTALL_DIR}/log-clean.sh"
 
-    local cron_now
-    cron_now=$(crontab -l 2>/dev/null || echo "")
-    [[ "$cron_now" != *"log-clean.sh"* ]] && \
-        (echo "$cron_now"; echo "0 */6 * * * ${INSTALL_DIR}/log-clean.sh >/dev/null 2>&1") | crontab -
+    if command -v crontab &>/dev/null; then
+        local cron_now
+        cron_now=$(crontab -l 2>/dev/null || echo "")
+        [[ "$cron_now" != *"log-clean.sh"* ]] && \
+            (echo "$cron_now"; echo "0 */6 * * * ${INSTALL_DIR}/log-clean.sh >/dev/null 2>&1") | crontab - 2>/dev/null
+    fi
 }
 
 # ============================================================
@@ -1607,7 +1609,7 @@ do_uninstall() {
     pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
     pkill -f "${INSTALL_DIR}/argo" 2>/dev/null || true
 
-    crontab -l 2>/dev/null | grep -v "xray" | grep -v "watchdog" | grep -v "log-clean" | crontab - 2>/dev/null
+    crontab -l 2>/dev/null | grep -v "xray" | grep -v "watchdog" | grep -v "log-clean" | crontab - 2>/dev/null 2>/dev/null
 
     is_root && sed -i "/xray-boot.sh/d" /etc/rc.local 2>/dev/null || true
     rm -f /etc/profile.d/xray-check.sh 2>/dev/null
