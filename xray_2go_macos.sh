@@ -125,11 +125,11 @@ download_xray() {
 
     local version
     version=$(curl -fsSL --max-time 10 \
-        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | \
-        python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" \
-        2>/dev/null || echo "v25.3.6")
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | \
+        grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
+    [[ -z "$version" ]] && version="v26.3.27"
 
-    log "INFO" "下载 Xray ${version} (${arch})..."
+    log "INFO" "下载 Xray ${version} (${arch} -> ${xray_arch})..."
 
     local url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-macos-${xray_arch}.zip"
     local tmp="/tmp/xray-macos.zip"
@@ -141,13 +141,12 @@ download_xray() {
     unzip -qo "$tmp" -d "$extract_dir"
     mv "${extract_dir}/xray" "${INSTALL_DIR}/xray"
     chmod +x "${INSTALL_DIR}/xray"
-
-    # 移除 macOS 隔离标志（Gatekeeper）
     xattr -d com.apple.quarantine "${INSTALL_DIR}/xray" 2>/dev/null || true
-
     rm -rf "$tmp" "$extract_dir"
+
     log "INFO" "Xray 已安装: ${INSTALL_DIR}/xray"
 }
+
 
 download_argo() {
     local arch
