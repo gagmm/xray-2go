@@ -1,499 +1,588 @@
 #!/bin/bash
+# ============================================================
+# Xray-2go macOS 完整脚本
+# 支持: macOS 12+ (Monterey / Ventura / Sonoma / Sequoia)
+# 支持: Apple Silicon (arm64) / Intel (amd64)
+# 权限: 纯用户权限，无需 sudo
+# 版本: 2.0
+# ============================================================
 
-# ===========================================
-# Xray-2go macOS 适配版 (root 环境，无 Homebrew)
-# 所有依赖直接下载二进制，不依赖 brew
-# 自动选择可用端口，支持导出代理为 txt
-# ===========================================
+set -euo pipefail
 
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+# ============================================================
+# 全局变量
+# ============================================================
+SCRIPT_VERSION="2.0"
+INSTALL_DIR="${HOME}/.xray"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+LOG_DIR="${INSTALL_DIR}/logs"
+CDN_HOST="cdns.doon.eu.org"
 
-# 定义颜色
-re="\033[0m"
-red="\033[1;91m"
-green="\e[1;32m"
-yellow="\e[1;33m"
-purple="\e[1;35m"
-skyblue="\e[1;36m"
-red() { echo -e "\033[1;91m$1\033[0m"; }
-green() { echo -e "\033[1;32m$1\033[0m"; }
-yellow() { echo -e "\033[1;33m$1\033[0m"; }
-purple() { echo -e "\033[1;35m$1\033[0m"; }
-skyblue() { echo -e "\033[1;36m$1\033[0m"; }
-reading() { read -p "$(red "$1")" "$2"; }
+# 颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+PURPLE='\033[0;35m'
+NC='\033[0m'
 
-# 定义常量
-server_name="xray"
-work_dir="$HOME/.xray"
-config_dir="${work_dir}/config.json"
-client_dir="${work_dir}/url.txt"
-launchd_dir="$HOME/Library/LaunchAgents"
-export_dir="$(pwd)"
-
-# 自动查找可用端口
-find_available_port() {
-    local start_port=${1:-1000}
-    local end_port=${2:-60000}
-    local port
-    for i in $(seq 1 50); do
-        port=$(jot -r 1 "$start_port" "$end_port")
-        if ! lsof -iTCP:"$port" -sTCP:LISTEN &>/dev/null; then
-            echo "$port"
-            return 0
-        fi
-    done
-    red "无法找到可用端口"
-    exit 1
-}
-
-# 自动查找连续可用端口（用于 ARGO_PORT / PORT / GRPC / XHTTP）
-assign_ports() {
-    yellow "正在自动分配可用端口..."
-    export PORT=$(find_available_port 1000 60000)
-    export ARGO_PORT=$(find_available_port 8000 9000)
-    # 确保 ARGO_PORT 与 PORT 不同
-    while [ "$ARGO_PORT" = "$PORT" ]; do
-        export ARGO_PORT=$(find_available_port 8000 9000)
-    done
-    export GRPC_PORT=$(find_available_port 10000 30000)
-    while [ "$GRPC_PORT" = "$PORT" ] || [ "$GRPC_PORT" = "$ARGO_PORT" ]; do
-        export GRPC_PORT=$(find_available_port 10000 30000)
-    done
-    export XHTTP_PORT=$(find_available_port 30001 50000)
-    export VISION_PORT=$(find_available_port 10000 65000)
-    export SS_PORT=$(find_available_port 10000 65000)
-    export TROJAN_PORT=$(find_available_port 10000 65000)
-    export XHTTP_H3_PORT=$(find_available_port 10000 65000)
-    while [ "$XHTTP_PORT" = "$PORT" ] || [ "$XHTTP_PORT" = "$ARGO_PORT" ] || [ "$XHTTP_PORT" = "$GRPC_PORT" ]; do
-        export XHTTP_PORT=$(find_available_port 30001 50000)
-    export VISION_PORT=$(find_available_port 10000 65000)
-    export SS_PORT=$(find_available_port 10000 65000)
-    export TROJAN_PORT=$(find_available_port 10000 65000)
-    export XHTTP_H3_PORT=$(find_available_port 10000 65000)
-    done
-    green "端口分配完成："
-    green "  订阅端口 (PORT):       $PORT"
-    green "  Argo 端口 (ARGO_PORT): $ARGO_PORT"
-    green "  GRPC 端口:             $GRPC_PORT"
-    green "  XHTTP 端口:            $XHTTP_PORT"
-}
-
-# 定义环境变量
-export UUID=${UUID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}
-export CFIP=${CFIP:-'cdns.doon.eu.org'}
-export CFPORT=${CFPORT:-'443'}
-
-# 获取系统架构
-get_arch() {
-    ARCH_RAW=$(uname -m)
-    case "${ARCH_RAW}" in
-        'x86_64') ARCH='amd64'; ARCH_ARG='64' ;;
-        'arm64')  ARCH='arm64'; ARCH_ARG='arm64-v8a' ;;
-        *) red "不支持的架构: ${ARCH_RAW}"; exit 1 ;;
+# ============================================================
+# 日志函数
+# ============================================================
+log() {
+    local level="$1"
+    local msg="$2"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    case "$level" in
+        INFO)  echo -e "${GREEN}[${timestamp}] [INFO]${NC}  $msg" ;;
+        WARN)  echo -e "${YELLOW}[${timestamp}] [WARN]${NC}  $msg" ;;
+        ERROR) echo -e "${RED}[${timestamp}] [ERROR]${NC} $msg" ;;
+        STEP)  echo -e "${CYAN}[${timestamp}] [STEP]${NC}  ===== $msg =====" ;;
     esac
 }
 
-# 获取真实 IP - 多 API 兜底
-get_realip() {
-    local apis=(
-        "ifconfig.me"
-        "api.ipify.org"
-        "icanhazip.com"
-        "ipecho.net/plain"
-        "checkip.amazonaws.com"
-        "ipv4.ip.sb"
-    )
+die() {
+    log "ERROR" "$1"
+    exit 1
+}
 
-    local ip=""
-    for api in "${apis[@]}"; do
-        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
-        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return
+# ============================================================
+# macOS 平台检测
+# ============================================================
+get_arch() {
+    case "$(uname -m)" in
+        arm64)         echo "arm64" ;;
+        x86_64)        echo "amd64" ;;
+        *)             die "不支持的架构: $(uname -m)" ;;
+    esac
+}
+
+get_macos_version() {
+    sw_vers -productVersion 2>/dev/null || echo "unknown"
+}
+
+check_macos_version() {
+    local ver
+    ver=$(get_macos_version)
+    local major
+    major=$(echo "$ver" | cut -d. -f1)
+    if [[ "$major" -lt 12 ]]; then
+        log "WARN" "macOS ${ver} 可能存在兼容性问题，建议 12.0+"
+    else
+        log "INFO" "macOS ${ver} ✅"
+    fi
+}
+
+# ============================================================
+# 依赖检查
+# ============================================================
+check_deps() {
+    log "STEP" "检查依赖"
+
+    # 检查 Homebrew（可选）
+    if ! command -v brew &>/dev/null; then
+        log "WARN" "未检测到 Homebrew，部分功能可能受限"
+    fi
+
+    # 必需工具检查
+    local deps=("curl" "openssl" "python3" "unzip")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &>/dev/null; then
+            die "缺少必需工具: ${dep}，请先安装 Xcode Command Line Tools: xcode-select --install"
         fi
     done
 
-    # IPv4 全部失败，尝试 IPv6
-    local ipv6_apis=(
-        "api64.ipify.org"
-        "ipv6.ip.sb"
-    )
-    for api in "${ipv6_apis[@]}"; do
-        ip=$(curl -s --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
-        if [ -n "$ip" ]; then
-            echo "[$ip]"
-            return
-        fi
+    # 检查 crontab
+    if ! command -v crontab &>/dev/null; then
+        log "WARN" "crontab 不可用，将跳过 cron 持久化层"
+    fi
+
+    log "INFO" "依赖检查通过"
+}
+
+# ============================================================
+# 下载函数
+# ============================================================
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local desc="${3:-文件}"
+
+    log "INFO" "下载 ${desc}..."
+    curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url" || die "下载失败: $url"
+}
+
+download_xray() {
+    local arch
+    arch=$(get_arch)
+    local xray_arch
+    case "$arch" in
+        arm64) xray_arch="arm64-v8a" ;;
+        amd64) xray_arch="64" ;;
+    esac
+
+    local version
+    version=$(curl -fsSL --max-time 10 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | \
+        python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" \
+        2>/dev/null || echo "v25.3.6")
+
+    log "INFO" "下载 Xray ${version} (${arch})..."
+
+    local url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-macos-${xray_arch}.zip"
+    local tmp="/tmp/xray-macos.zip"
+    local extract_dir="/tmp/xray-macos-extract"
+
+    download_file "$url" "$tmp" "Xray-core for macOS"
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    unzip -qo "$tmp" -d "$extract_dir"
+    mv "${extract_dir}/xray" "${INSTALL_DIR}/xray"
+    chmod +x "${INSTALL_DIR}/xray"
+
+    # 移除 macOS 隔离标志（Gatekeeper）
+    xattr -d com.apple.quarantine "${INSTALL_DIR}/xray" 2>/dev/null || true
+
+    rm -rf "$tmp" "$extract_dir"
+    log "INFO" "Xray 已安装: ${INSTALL_DIR}/xray"
+}
+
+download_argo() {
+    local arch
+    arch=$(get_arch)
+    local url
+
+    case "$arch" in
+        arm64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64" ;;
+        amd64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64" ;;
+    esac
+
+    download_file "$url" "${INSTALL_DIR}/argo" "cloudflared for macOS"
+    chmod +x "${INSTALL_DIR}/argo"
+
+    # 移除隔离标志
+    xattr -d com.apple.quarantine "${INSTALL_DIR}/argo" 2>/dev/null || true
+
+    log "INFO" "cloudflared 已安装: ${INSTALL_DIR}/argo"
+}
+
+# ============================================================
+# 端口生成
+# ============================================================
+gen_random_port() {
+    local exclude=("$@")
+    local port
+    while true; do
+        port=$(python3 -c "import random; print(random.randint(10000,65000))")
+        local conflict=0
+        for ex in "${exclude[@]:-}"; do
+            [[ "$port" == "$ex" ]] && conflict=1 && break
+        done
+        [[ $conflict -eq 0 ]] && echo "$port" && return
     done
-
-    # 全部失败，手动输入
-    red "无法自动获取公网 IP"
-    reading "请手动输入你的服务器公网 IP: " manual_ip
-    if [ -n "$manual_ip" ]; then
-        echo "$manual_ip"
-    else
-        echo "127.0.0.1"
-    fi
 }
 
-# 检查 xray 是否已安装和运行
-check_xray() {
-    if [ -f "${work_dir}/${server_name}" ]; then
-        if launchctl list 2>/dev/null | grep -q "com.xray.service"; then
-            green "running"
-            return 0
-        else
-            yellow "not running"
-            return 1
-        fi
-    else
-        red "not installed"
-        return 2
-    fi
+generate_ports() {
+    log "STEP" "生成随机端口"
+
+    SUB_PORT=$(gen_random_port)
+    ARGO_PORT=$(gen_random_port "$SUB_PORT")
+    GRPC_PORT=$(gen_random_port "$SUB_PORT" "$ARGO_PORT")
+    XHTTP_PORT=$(gen_random_port "$SUB_PORT" "$ARGO_PORT" "$GRPC_PORT")
+    VISION_PORT=$(gen_random_port "$SUB_PORT" "$ARGO_PORT" "$GRPC_PORT" "$XHTTP_PORT")
+    SS_PORT=$(gen_random_port "$SUB_PORT" "$ARGO_PORT" "$GRPC_PORT" "$XHTTP_PORT" "$VISION_PORT")
+    XHTTP_H3_PORT=$(gen_random_port "$SUB_PORT" "$ARGO_PORT" "$GRPC_PORT" "$XHTTP_PORT" "$VISION_PORT" "$SS_PORT")
+
+    log "INFO" "订阅:${SUB_PORT} Argo:${ARGO_PORT} GRPC:${GRPC_PORT}"
+    log "INFO" "XHTTP:${XHTTP_PORT} Vision:${VISION_PORT} SS:${SS_PORT} H3:${XHTTP_H3_PORT}"
 }
 
-# 检查 argo 是否已安装和运行
-check_argo() {
-    if [ -f "${work_dir}/argo" ]; then
-        if launchctl list 2>/dev/null | grep -q "com.cloudflare.tunnel"; then
-            green "running"
-            return 0
-        else
-            yellow "not running"
-            return 1
-        fi
-    else
-        red "not installed"
-        return 2
-    fi
-}
+# ============================================================
+# 生成密钥和 UUID
+# ============================================================
+generate_keys() {
+    log "STEP" "生成密钥"
 
-# 检查 caddy 是否已安装
-check_caddy() {
-    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
-        if launchctl list 2>/dev/null | grep -q "com.caddy.service"; then
-            green "running"
-            return 0
-        else
-            yellow "not running"
-            return 1
-        fi
-    else
-        red "not installed"
-        return 2
-    fi
-}
+    UUID=$(python3 -c "import uuid; print(uuid.uuid4())")
 
-# 安装依赖 - 直接下载二进制
-manage_packages() {
-    if [ $# -lt 2 ]; then
-        red "未指定包名或操作"
-        return 1
-    fi
+    local output
+    output=$("${INSTALL_DIR}/xray" x25519 2>/dev/null)
+    private_key=$(echo "$output" | awk '/Private/{print $NF}')
+    public_key=$(echo "$output" | awk '/Public/{print $NF}')
 
-    action=$1
-    shift
+    [[ -z "$private_key" ]] && die "生成 x25519 密钥失败"
+    [[ -z "$public_key"  ]] && die "生成 x25519 公钥失败"
 
-    get_arch
-
-    for package in "$@"; do
-        if [ "$action" == "install" ]; then
-            case "$package" in
-                lsof|openssl|coreutils|iptables|unzip)
-                    green "${package} macOS 自带或不需要，跳过"
-                    continue
-                    ;;
-            esac
-
-            if command -v "$package" &>/dev/null; then
-                green "${package} already installed"
-                continue
-            fi
-
-            yellow "正在安装 ${package}..."
-            case "$package" in
-                jq)
-                    curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/latest/download/jq-macos-${ARCH}"
-                    chmod +x /usr/local/bin/jq
-                    xattr -d com.apple.quarantine /usr/local/bin/jq 2>/dev/null
-                    if command -v jq &>/dev/null; then
-                        green "jq 安装成功"
-                    else
-                        red "jq 安装失败"
-                    fi
-                    ;;
-                qrencode)
-                    cat > "${work_dir}/qrencode" << 'QREOF'
-#!/bin/bash
-echo ""
-echo "========== 订阅二维码 =========="
-echo "(macOS root 环境暂不支持终端二维码)"
-echo "请复制以下链接到浏览器或手机扫码工具："
-echo ""
-echo "$1"
-echo ""
-echo "================================"
-QREOF
-                    chmod +x "${work_dir}/qrencode"
-                    green "qrencode 替代脚本已创建"
-                    ;;
-                *)
-                    yellow "${package} 跳过安装"
-                    ;;
-            esac
-
-        elif [ "$action" == "uninstall" ]; then
-            case "$package" in
-                jq)
-                    rm -f /usr/local/bin/jq
-                    green "jq 已卸载"
-                    ;;
-                caddy)
-                    rm -f /usr/local/bin/caddy
-                    green "caddy 已卸载"
-                    ;;
-                *)
-                    yellow "${package} 跳过卸载"
-                    ;;
-            esac
-        fi
-    done
-    return 0
-}
-
-# 安装 caddy - 直接下载二进制
-install_caddy() {
-    if command -v caddy &>/dev/null; then
-        green "caddy already installed"
-        return
-    fi
-    yellow "正在下载安装 caddy..."
-    get_arch
-
-    CADDY_VERSION=$(curl -s https://api.github.com/repos/caddyserver/caddy/releases/latest | grep '"tag_name"' | sed -E 's/.*"v([^"]+)".*/\1/')
-    if [ -z "$CADDY_VERSION" ]; then
-        CADDY_VERSION="2.9.1"
-    fi
-
-    curl -sLo /tmp/caddy.tar.gz "https://github.com/caddyserver/caddy/releases/download/v${CADDY_VERSION}/caddy_${CADDY_VERSION}_mac_${ARCH}.tar.gz"
-    if [ $? -ne 0 ]; then
-        red "caddy 下载失败"
-        return 1
-    fi
-
-    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
-    tar -xzf /tmp/caddy.tar.gz -C /tmp/ 2>/dev/null
-    mv /tmp/caddy /usr/local/bin/caddy 2>/dev/null
-    chmod +x /usr/local/bin/caddy
-    xattr -d com.apple.quarantine /usr/local/bin/caddy 2>/dev/null
-    rm -f /tmp/caddy.tar.gz /tmp/LICENSE /tmp/README.md
-
-    if command -v caddy &>/dev/null; then
-        green "caddy v${CADDY_VERSION} 安装成功"
-    else
-        red "caddy 安装失败"
-    fi
-}
-
-# 下载并安装 xray, cloudflared
-install_xray() {
-    clear
-    purple "正在安装 Xray-2go (macOS) 中，请稍等..."
-    get_arch
-
-    # 自动分配端口
-    assign_ports
-
-    # 创建工作目录
-    [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 755 "${work_dir}"
-    [ ! -d "${launchd_dir}" ] && mkdir -p "${launchd_dir}"
-
-    # 下载 xray (macOS 版本)
-    yellow "下载 Xray..."
-    curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-macos-${ARCH_ARG}.zip"
-    if [ $? -ne 0 ]; then
-        red "Xray 下载失败"
-        exit 1
-    fi
-
-    # 下载 cloudflared
-    yellow "下载 cloudflared..."
-    curl -sLo "/tmp/cloudflared.tgz" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}.tgz"
-    if [ $? -eq 0 ]; then
-        tar -xzf /tmp/cloudflared.tgz -C "${work_dir}/" 2>/dev/null
-        if [ -f "${work_dir}/cloudflared" ]; then
-            mv "${work_dir}/cloudflared" "${work_dir}/argo"
-        fi
-        rm -f /tmp/cloudflared.tgz
-    else
-        yellow "尝试备用下载方式..."
-        curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-${ARCH}"
-    fi
-
-    # 解压 xray
-    unzip -o "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1
-    chmod +x "${work_dir}/${server_name}" "${work_dir}/argo" 2>/dev/null
-
-    # 解除 macOS quarantine
-    xattr -d com.apple.quarantine "${work_dir}/${server_name}" 2>/dev/null
-    xattr -d com.apple.quarantine "${work_dir}/argo" 2>/dev/null
-
-    rm -rf "${work_dir}/${server_name}.zip" "${work_dir}/geosite.dat" "${work_dir}/geoip.dat" "${work_dir}/README.md" "${work_dir}/LICENSE"
-
-    # 验证文件
-    if [ ! -f "${work_dir}/${server_name}" ]; then
-        red "Xray 二进制文件不存在，安装失败"
-        exit 1
-    fi
-    if [ ! -f "${work_dir}/argo" ]; then
-        red "cloudflared 二进制文件不存在，安装失败"
-        exit 1
-    fi
-
-    green "Xray 和 cloudflared 下载完成"
-
-    # 生成随机密码
-    password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
     ss_password=$(openssl rand -base64 16)
     trojan_password=$(openssl rand -hex 16)
+    SUB_TOKEN=$(openssl rand -hex 16)
 
-    # 生成 x25519 密钥对
-    output=$("${work_dir}/xray" x25519 2>&1)
-    private_key=$(echo "${output}" | grep -i "private" | awk '{print $NF}')
-    public_key=$(echo "${output}" | grep -i "public" | awk '{print $NF}')
+    log "INFO" "UUID: ${UUID}"
+    log "INFO" "PublicKey: ${public_key}"
+}
 
-    if [ -z "$private_key" ] || [ -z "$public_key" ]; then
-        red "x25519 密钥生成失败，输出如下："
-        echo "$output"
-        exit 1
-    fi
-
-    green "密钥对生成成功"
-
-    # 保存端口和密码信息到文件（供后续函数读取）
-    cat > "${work_dir}/ports.env" << EOF
-PORT=$PORT
-ARGO_PORT=$ARGO_PORT
-GRPC_PORT=$GRPC_PORT
-XHTTP_PORT=$XHTTP_PORT
-VISION_PORT=$VISION_PORT
-SS_PORT=$SS_PORT
-TROJAN_PORT=$TROJAN_PORT
-XHTTP_H3_PORT=$XHTTP_H3_PORT
-ss_password=$ss_password
-trojan_password=$trojan_password
-password=$password
-private_key=$private_key
-public_key=$public_key
-UUID=$UUID
+# ============================================================
+# 写入 ports.env
+# ============================================================
+save_ports_env() {
+    cat > "${INSTALL_DIR}/ports.env" << EOF
+SUB_PORT=${SUB_PORT}
+ARGO_PORT=${ARGO_PORT}
+GRPC_PORT=${GRPC_PORT}
+XHTTP_PORT=${XHTTP_PORT}
+VISION_PORT=${VISION_PORT}
+SS_PORT=${SS_PORT}
+XHTTP_H3_PORT=${XHTTP_H3_PORT}
+UUID=${UUID}
+private_key=${private_key}
+public_key=${public_key}
+ss_password=${ss_password}
+trojan_password=${trojan_password}
+SUB_TOKEN=${SUB_TOKEN}
+CF_TUNNEL_TOKEN=
+CF_TUNNEL_ID=
+CF_TUNNEL_NAME=
+CF_TUNNEL_DOMAIN=
+ARGO_DOMAIN=
 EOF
+    chmod 600 "${INSTALL_DIR}/ports.env"
+}
 
-    # 生成配置文件
-    cat > "${config_dir}" << EOF
+# ============================================================
+# 生成 Xray 配置
+# ============================================================
+generate_config() {
+    log "STEP" "生成 Xray 配置"
+    cat > "${INSTALL_DIR}/config.json" << EOF
 {
-  "log": { "access": "/dev/null", "error": "/dev/null", "loglevel": "none" },
+  "log": {"loglevel": "warning"},
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      {"type": "field", "ip": ["geoip:private"], "outboundTag": "block"},
+      {"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": "block"}
+    ]
+  },
   "inbounds": [
     {
-      "port": $ARGO_PORT,
+      "listen": "0.0.0.0",
+      "port": ${ARGO_PORT},
       "protocol": "vless",
       "settings": {
-        "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
+        "clients": [{"id": "${UUID}"}],
         "decryption": "none",
         "fallbacks": [
-          { "dest": 3001 }, { "path": "/vless-argo", "dest": 3002 },
-          { "path": "/vmess-argo", "dest": 3003 }
+          {"path": "/vless-argo?ed=2560",  "dest": 3001},
+          {"path": "/vmess-argo?ed=2560",  "dest": 3002},
+          {"path": "/trojan-argo?ed=2560", "dest": 3003}
         ]
       },
-      "streamSettings": { "network": "tcp" }
-    },
-    {
-      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
-      "streamSettings": { "network": "tcp", "security": "none" }
-    },
-    {
-      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
-      "settings": { "clients": [{ "id": "$UUID", "level": 0 }], "decryption": "none" },
-      "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
-    },
-    {
-      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
-      "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
-      "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
-    },
-    {
-      "listen":"::", "port": $XHTTP_PORT, "protocol": "vless",
-      "settings": {"clients": [{"id": "$UUID"}], "decryption": "none"},
-      "streamSettings": {"network": "xhttp", "security": "reality", "realitySettings": {"target": "www.nazhumi.com:443", "xver": 0, "serverNames":
-      ["www.nazhumi.com"], "privateKey": "$private_key", "shortIds": [""]}},
+      "streamSettings": {"network": "tcp"},
       "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
     },
     {
-      "listen":"::", "port":$GRPC_PORT, "protocol":"vless",
-      "settings":{"clients":[{"id":"$UUID"}], "decryption":"none"},
-      "streamSettings":{"network":"grpc", "security":"reality", "realitySettings":{"dest":"www.iij.ad.jp:443", "serverNames":["www.iij.ad.jp"],
-      "privateKey":"$private_key", "shortIds":[""]}, "grpcSettings":{"serviceName":"grpc"}},
-      "sniffing":{"enabled":true, "destOverride":["http","tls","quic"]}
+      "listen": "127.0.0.1",
+      "port": 3001,
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {"path": "/vless-argo?ed=2560"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 3002,
+      "protocol": "vmess",
+      "settings": {"clients": [{"id": "${UUID}", "alterId": 0}]},
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {"path": "/vmess-argo?ed=2560"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "127.0.0.1",
+      "port": 3003,
+      "protocol": "trojan",
+      "settings": {"clients": [{"password": "${trojan_password}"}]},
+      "streamSettings": {
+        "network": "ws",
+        "wsSettings": {"path": "/trojan-argo?ed=2560"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": ${XHTTP_PORT},
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.nazhumi.com:443",
+          "xver": 0,
+          "serverNames": ["www.nazhumi.com"],
+          "privateKey": "${private_key}",
+          "shortIds": [""]
+        },
+        "xhttpSettings": {"mode": "auto"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": ${GRPC_PORT},
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "grpc",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.iij.ad.jp:443",
+          "xver": 0,
+          "serverNames": ["www.iij.ad.jp"],
+          "privateKey": "${private_key}",
+          "shortIds": [""]
+        },
+        "grpcSettings": {"serviceName": "grpc"}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": ${VISION_PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [{"id": "${UUID}", "flow": "xtls-rprx-vision"}],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.microsoft.com:443",
+          "xver": 0,
+          "serverNames": ["www.microsoft.com"],
+          "privateKey": "${private_key}",
+          "shortIds": [""]
+        }
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": ${SS_PORT},
+      "protocol": "shadowsocks",
+      "settings": {
+        "method": "2022-blake3-aes-128-gcm",
+        "password": "${ss_password}",
+        "network": "tcp,udp"
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
+    },
+    {
+      "listen": "0.0.0.0",
+      "port": ${XHTTP_H3_PORT},
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "${UUID}"}], "decryption": "none"},
+      "streamSettings": {
+        "network": "xhttp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "www.apple.com:443",
+          "xver": 0,
+          "serverNames": ["www.apple.com"],
+          "privateKey": "${private_key}",
+          "shortIds": [""]
+        },
+        "xhttpSettings": {"mode": "auto", "noSSEHeader": true}
+      },
+      "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
     }
   ],
-  "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "blackhole", "tag": "block" }
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
   ]
 }
 EOF
-    green "配置文件已生成"
+    log "INFO" "配置文件已生成"
 }
 
-# 加载保存的端口配置
-load_ports() {
-    if [ -f "${work_dir}/ports.env" ]; then
-        source "${work_dir}/ports.env"
-    fi
+# ============================================================
+# 订阅服务器
+# ============================================================
+generate_sub_server() {
+    cat > "${INSTALL_DIR}/sub_server.py" << 'PYEOF'
+#!/usr/bin/env python3
+import os, base64, json, re
+import http.server, socketserver
+
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def load_env():
+    env = {}
+    env_file = os.path.join(INSTALL_DIR, "ports.env")
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    env[k.strip()] = v.strip()
+    return env
+
+def get_public_ip():
+    import urllib.request
+    for url in ['https://api.ipify.org', 'https://ifconfig.me', 'https://ip.sb']:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return r.read().decode().strip()
+        except:
+            continue
+    return "unknown"
+
+def get_argo_domain(env):
+    for key in ['CF_TUNNEL_DOMAIN', 'ARGO_DOMAIN']:
+        if env.get(key):
+            return env[key]
+    if env.get('CF_TUNNEL_ID'):
+        return f"{env['CF_TUNNEL_ID']}.cfargotunnel.com"
+    log_file = os.path.join(INSTALL_DIR, "logs", "argo.log")
+    if os.path.exists(log_file):
+        with open(log_file) as f:
+            for line in f:
+                m = re.search(r'https://([a-z0-9\-]+\.trycloudflare\.com)', line)
+                if m:
+                    return m.group(1)
+    return ""
+
+def generate_links(env, ip):
+    uuid          = env.get('UUID', '')
+    public_key    = env.get('public_key', '')
+    ss_password   = env.get('ss_password', '')
+    trojan_pw     = env.get('trojan_password', '')
+    grpc_port     = env.get('GRPC_PORT', '')
+    xhttp_port    = env.get('XHTTP_PORT', '')
+    vision_port   = env.get('VISION_PORT', '')
+    ss_port       = env.get('SS_PORT', '')
+    h3_port       = env.get('XHTTP_H3_PORT', '')
+    argo_domain   = get_argo_domain(env)
+    cdn           = "cdns.doon.eu.org"
+    n             = ip
+    links         = []
+
+    # 1. VLESS TCP Vision Reality
+    links.append(
+        f"vless://{uuid}@{ip}:{vision_port}?"
+        f"encryption=none&flow=xtls-rprx-vision&security=reality"
+        f"&sni=www.microsoft.com&fp=chrome&pbk={public_key}"
+        f"&type=tcp#{n}-Vision-Reality"
+    )
+    # 2. VLESS XHTTP Reality
+    links.append(
+        f"vless://{uuid}@{ip}:{xhttp_port}?"
+        f"encryption=none&security=reality&sni=www.nazhumi.com"
+        f"&fp=chrome&pbk={public_key}&allowInsecure=1"
+        f"&type=xhttp&mode=auto#{n}-XHTTP-Reality"
+    )
+    # 3. VLESS gRPC Reality
+    links.append(
+        f"vless://{uuid}@{ip}:{grpc_port}?"
+        f"encryption=none&security=reality&sni=www.iij.ad.jp"
+        f"&fp=chrome&pbk={public_key}&allowInsecure=1"
+        f"&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#{n}-gRPC-Reality"
+    )
+    # 4. VLESS XHTTP H3 Reality
+    links.append(
+        f"vless://{uuid}@{ip}:{h3_port}?"
+        f"encryption=none&security=reality&sni=www.apple.com"
+        f"&fp=chrome&pbk={public_key}&allowInsecure=1"
+        f"&type=xhttp&mode=auto#{n}-XHTTP-H3-Reality"
+    )
+    # 5. Shadowsocks 2022
+    ss_cred = base64.b64encode(
+        f"2022-blake3-aes-128-gcm:{ss_password}".encode()
+    ).decode()
+    links.append(f"ss://{ss_cred}@{ip}:{ss_port}#{n}-SS2022")
+
+    if argo_domain:
+        # 6. VLESS WS Argo
+        links.append(
+            f"vless://{uuid}@{cdn}:443?"
+            f"encryption=none&security=tls&sni={argo_domain}"
+            f"&fp=chrome&type=ws&host={argo_domain}"
+            f"&path=%2Fvless-argo%3Fed%3D2560#{n}-VLESS-WS-Argo"
+        )
+        # 7. VMess WS Argo
+        vmess_obj = {
+            "v":"2","ps":f"{n}-VMess-WS-Argo","add":cdn,
+            "port":"443","id":uuid,"aid":"0","scy":"none",
+            "net":"ws","type":"none","host":argo_domain,
+            "path":"/vmess-argo?ed=2560","tls":"tls",
+            "sni":argo_domain,"alpn":"","fp":"chrome"
+        }
+        vmess_b64 = base64.b64encode(json.dumps(vmess_obj).encode()).decode()
+        links.append(f"vmess://{vmess_b64}")
+        # 8. Trojan WS Argo
+        links.append(
+            f"trojan://{trojan_pw}@{cdn}:443?"
+            f"security=tls&sni={argo_domain}&fp=chrome"
+            f"&type=ws&host={argo_domain}"
+            f"&path=%2Ftrojan-argo%3Fed%3D2560#{n}-Trojan-WS-Argo"
+        )
+
+    return "\n".join(links)
+
+class SubHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args): pass
+    def do_GET(self):
+        env   = load_env()
+        token = env.get('SUB_TOKEN', '')
+        if self.path != f"/{token}":
+            self.send_response(404); self.end_headers(); return
+        ip      = get_public_ip()
+        links   = generate_links(env, ip)
+        content = base64.b64encode(links.encode()).decode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content.encode())
+
+if __name__ == "__main__":
+    env  = load_env()
+    port = int(env.get('SUB_PORT', 49023))
+    with socketserver.TCPServer(("0.0.0.0", port), SubHandler) as httpd:
+        httpd.serve_forever()
+PYEOF
+    chmod +x "${INSTALL_DIR}/sub_server.py"
 }
 
-# macOS launchd 守护进程
-macos_launchd_services() {
-    load_ports
-    cat > "${launchd_dir}/com.xray.service.plist" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.xray.service</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${work_dir}/xray</string>
+# ============================================================
+# LaunchAgent plist 生成
+# ============================================================
+get_tunnel_args_plist() {
+    source "${INSTALL_DIR}/ports.env"
+    if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+        cat << EOF
+        <string>tunnel</string>
+        <string>--no-autoupdate</string>
         <string>run</string>
-        <string>-c</string>
-        <string>${config_dir}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>${work_dir}/xray_error.log</string>
-    <key>StandardOutPath</key>
-    <string>${work_dir}/xray_out.log</string>
-</dict>
-</plist>
+        <string>--token</string>
+        <string>${CF_TUNNEL_TOKEN}</string>
 EOF
-
-    cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.cloudflare.tunnel</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${work_dir}/argo</string>
+    else
+        cat << EOF
         <string>tunnel</string>
         <string>--url</string>
         <string>http://localhost:${ARGO_PORT}</string>
@@ -502,1026 +591,992 @@ EOF
         <string>auto</string>
         <string>--protocol</string>
         <string>http2</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>${work_dir}/argo.log</string>
-    <key>StandardOutPath</key>
-    <string>${work_dir}/argo.log</string>
-</dict>
-</plist>
 EOF
-
-    launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
-    launchctl load -w "${launchd_dir}/com.xray.service.plist"
-    launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
-    launchctl load -w "${launchd_dir}/com.cloudflare.tunnel.plist"
-    green "launchd 服务已加载"
+    fi
 }
 
-# Caddy launchd 服务
-macos_caddy_launchd() {
-    local caddy_path
-    caddy_path=$(which caddy 2>/dev/null || echo "/usr/local/bin/caddy")
+generate_launch_agents() {
+    log "STEP" "生成 LaunchAgent plist"
+    mkdir -p "$PLIST_DIR" "$LOG_DIR"
+    source "${INSTALL_DIR}/ports.env"
 
-    cat > "${launchd_dir}/com.caddy.service.plist" << EOF
+    # --- Xray ---
+    cat > "${PLIST_DIR}/com.xray2go.xray.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.caddy.service</string>
+    <string>com.xray2go.xray</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${caddy_path}</string>
+        <string>${INSTALL_DIR}/xray</string>
         <string>run</string>
-        <string>--config</string>
-        <string>${work_dir}/Caddyfile</string>
+        <string>-c</string>
+        <string>${INSTALL_DIR}/config.json</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>${work_dir}/caddy_error.log</string>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
     <key>StandardOutPath</key>
-    <string>${work_dir}/caddy_out.log</string>
+    <string>${LOG_DIR}/xray.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/xray-error.log</string>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>65535</integer>
+    </dict>
+    <key>Nice</key>
+    <integer>-10</integer>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
 </dict>
 </plist>
 EOF
-}
 
-get_info() {
-    clear
-    load_ports
-    IP=$(get_realip)
+    # --- Tunnel ---
+    local tunnel_args
+    tunnel_args=$(get_tunnel_args_plist)
 
-    isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "vps")
-
-    if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..10}; do
-            purple "第 $i 次尝试获取 ArgoDomain 中..."
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-            [ -n "$argodomain" ] && break
-            sleep 3
-        done
-    else
-        restart_argo
-        sleep 8
-        for i in {1..5}; do
-            argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-            [ -n "$argodomain" ] && break
-            sleep 3
-        done
-    fi
-
-    if [ -z "$argodomain" ]; then
-        red "获取 Argo 临时域名失败，请稍后重试（菜单4 -> 5重新获取）"
-        argodomain="获取失败请重试"
-    fi
-
-    green "\nArgoDomain：${purple}$argodomain${re}\n"
-
-    cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
-
-vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
-
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}
-
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64)
-
-EOF
-    echo ""
-    while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-
-    base64 -i ${work_dir}/url.txt -o ${work_dir}/sub_tmp.txt
-    tr -d '\n' < ${work_dir}/sub_tmp.txt > ${work_dir}/sub.txt
-    rm -f ${work_dir}/sub_tmp.txt
-
-    yellow "\n温馨提醒：如果是 NAT 机，reality 端口和订阅端口需使用可用端口范围内的端口\n"
-    green "节点订阅链接：http://$IP:$PORT/$password\n\n订阅链接适用于 V2rayN, Nekbox, karing, Sterisand, Loon, 小火箭, 圈X 等\n"
-    green "订阅二维码"
-    ${work_dir}/qrencode "http://$IP:$PORT/$password"
-    echo ""
-
-    # 安装完成后自动导出一份到桌面
-    export_proxy_txt "auto"
-}
-
-# caddy 订阅配置
-add_caddy_conf() {
-    load_ports
-    cat > "${work_dir}/Caddyfile" << EOF
-{
-    auto_https off
-    log {
-        output file ${work_dir}/caddy.log {
-            roll_size 10MB
-            roll_keep 10
-            roll_keep_for 720h
-        }
-    }
-}
-
-:$PORT {
-    handle /$password {
-        root * ${work_dir}
-        try_files /sub.txt
-        file_server browse
-        header Content-Type "text/plain; charset=utf-8"
-    }
-
-    handle {
-        respond "404 Not Found" 404
-    }
-}
-EOF
-
-    caddy validate --config "${work_dir}/Caddyfile" > /dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        macos_caddy_launchd
-        launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
-        launchctl load -w "${launchd_dir}/com.caddy.service.plist"
-        green "Caddy 服务已启动"
-    else
-        red "Caddy 配置文件验证失败，订阅功能可能无法使用，但不影响节点使用"
-    fi
-}
-
-# ==========================================
-# 导出代理为 txt 功能
-# ==========================================
-export_proxy_txt() {
-    local mode="${1:-manual}"
-    load_ports
-
-    if [ ! -f "${work_dir}/url.txt" ]; then
-        red "节点文件不存在，请先安装 Xray-2go"
-        return 1
-    fi
-
-    local IP=$(get_realip)
-    local timestamp=$(date '+%Y%m%d_%H%M%S')
-    local export_file="${export_dir}/xray2go_proxy_${timestamp}.txt"
-    local export_file_latest="${export_dir}/xray2go_proxy_latest.txt"
-
-    # 读取 argo 域名
-    local argodomain=""
-    if [ -f "${work_dir}/argo.log" ]; then
-        argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-    fi
-
-    # 读取订阅链接信息
-    local sub_port="$PORT"
-    local sub_path="$password"
-    if [ -f "${work_dir}/Caddyfile" ]; then
-        sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
-        sub_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
-    fi
-
-    cat > "$export_file" << EXPORTEOF
-============================================
-  Xray-2go 代理节点信息
-  导出时间: $(date '+%Y-%m-%d %H:%M:%S')
-  服务器IP: ${IP}
-============================================
-
-【端口信息】
-  订阅端口:  ${sub_port}
-  Argo端口:  ${ARGO_PORT}
-  GRPC端口:  ${GRPC_PORT}
-  XHTTP端口: ${XHTTP_PORT}
-
-【UUID】
-  ${UUID}
-
-【Argo 域名】
-  ${argodomain:-未获取到}
-
-============================================
-  节点链接（可直接导入客户端）
-============================================
-
---- VLESS GRPC Reality ---
-$(sed -n '1p' "${work_dir}/url.txt")
-
---- VLESS XHTTP Reality ---
-$(sed -n '3p' "${work_dir}/url.txt")
-
---- VLESS WS (Argo) ---
-$(sed -n '5p' "${work_dir}/url.txt")
-
---- VMess WS (Argo) ---
-$(sed -n '7p' "${work_dir}/url.txt")
-
-============================================
-  订阅链接
-============================================
-
-http://${IP}:${sub_port}/${sub_path}
-
-============================================
-  使用说明
-============================================
-
-1. Reality 节点 (GRPC/XHTTP):
-   - 直连服务器 IP，无需域名
-   - 适合 IP 未被墙的情况
-
-2. Argo 节点 (VLESS-WS/VMess-WS):
-   - 通过 Cloudflare CDN 中转
-   - 适合 IP 被墙的情况
-   - 临时隧道域名每次重启会变化
-
-3. 订阅链接:
-   - 可导入 V2rayN, NekoBox, Karing,
-     Shadowrocket, Quantumult X, Loon 等
-   - 更新订阅即可获取最新节点
-
-4. 客户端推荐:
-   - iOS: Shadowrocket / Quantumult X / Loon
-   - Android: V2rayNG / NekoBox / Karing
-   - Windows: V2rayN / Clash Verge
-   - macOS: V2rayU / ClashX Pro
-
-============================================
-EXPORTEOF
-
-    # 同时生成一份 latest 版本（覆盖）
-    cp "$export_file" "$export_file_latest"
-
-    # 同时导出一份纯链接版本（方便复制）
-    local links_file="${export_dir}/xray2go_links_${timestamp}.txt"
-    local links_file_latest="${export_dir}/xray2go_links_latest.txt"
-
-    grep -v '^$' "${work_dir}/url.txt" > "$links_file"
-    echo "" >> "$links_file"
-    echo "# 订阅链接" >> "$links_file"
-    echo "http://${IP}:${sub_port}/${sub_path}" >> "$links_file"
-
-    cp "$links_file" "$links_file_latest"
-
-    if [ "$mode" = "auto" ]; then
-        green "\n代理信息已自动导出到桌面："
-    else
-        green "\n代理信息已导出到桌面："
-    fi
-    green "  详细版: ${export_file}"
-    green "  详细版(latest): ${export_file_latest}"
-    green "  纯链接: ${links_file}"
-    green "  纯链接(latest): ${links_file_latest}\n"
-}
-
-# 导出菜单
-export_menu() {
-    check_xray &>/dev/null
-    local xray_status=$?
-    if [ $xray_status -ne 0 ] && [ ! -f "${work_dir}/url.txt" ]; then
-        yellow "Xray-2go 尚未安装，无节点可导出"
-        sleep 1
-        return
-    fi
-
-    clear
-    echo ""
-    green "1. 导出到桌面 (详细版 + 纯链接版)"
-    skyblue "-----------------------------------"
-    green "2. 导出到自定义路径"
-    skyblue "-----------------------------------"
-    green "3. 在终端显示所有节点链接"
-    skyblue "-----------------------------------"
-    green "4. 复制订阅链接到剪贴板"
-    skyblue "-----------------------------------"
-    purple "5. 返回主菜单"
-    skyblue "-----------------------------------"
-    reading "请输入选择: " choice
-    case "${choice}" in
-        1)
-            export_proxy_txt "manual"
-            ;;
-        2)
-            reading "请输入导出路径 (如 /tmp): " custom_path
-            if [ -z "$custom_path" ]; then
-                custom_path="$export_dir"
-            fi
-            if [ ! -d "$custom_path" ]; then
-                mkdir -p "$custom_path" 2>/dev/null
-                if [ $? -ne 0 ]; then
-                    red "路径创建失败: $custom_path"
-                    return
-                fi
-            fi
-            local old_export_dir="$export_dir"
-            export_dir="$custom_path"
-            export_proxy_txt "manual"
-            export_dir="$old_export_dir"
-            ;;
-        3)
-            echo ""
-            green "========== 所有节点链接 =========="
-            echo ""
-            while IFS= read -r line; do
-                [ -n "$line" ] && echo -e "${purple}$line${re}"
-            done < ${work_dir}/url.txt
-
-            load_ports
-            local server_ip=$(get_realip)
-            local s_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
-            local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
-            echo ""
-            green "========== 订阅链接 =========="
-            green "http://$server_ip:$s_port/$s_path"
-            echo ""
-            green "================================"
-            ;;
-        4)
-            load_ports
-            local server_ip=$(get_realip)
-            local s_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
-            local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
-            local sub_link="http://$server_ip:$s_port/$s_path"
-            echo -n "$sub_link" | pbcopy 2>/dev/null
-            if [ $? -eq 0 ]; then
-                green "\n订阅链接已复制到剪贴板：$sub_link\n"
-            else
-                yellow "\n剪贴板复制失败，请手动复制：\n$sub_link\n"
-            fi
-            ;;
-        5) return ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
-# 启动 xray
-start_xray() {
-    check_xray &>/dev/null
-    local status=$?
-    if [ $status -eq 1 ]; then
-        yellow "\n正在启动 ${server_name} 服务\n"
-        launchctl load -w "${launchd_dir}/com.xray.service.plist" 2>/dev/null
-        sleep 1
-        if launchctl list 2>/dev/null | grep -q "com.xray.service"; then
-            green "${server_name} 服务已成功启动\n"
-        else
-            red "${server_name} 服务启动失败\n"
-        fi
-    elif [ $status -eq 0 ]; then
-        yellow "xray 正在运行\n"
-    else
-        yellow "xray 尚未安装!\n"
-    fi
-}
-
-# 停止 xray
-stop_xray() {
-    check_xray &>/dev/null
-    local status=$?
-    if [ $status -eq 0 ]; then
-        yellow "\n正在停止 ${server_name} 服务\n"
-        launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
-        sleep 1
-        green "${server_name} 服务已停止\n"
-    elif [ $status -eq 1 ]; then
-        yellow "xray 未运行\n"
-    else
-        yellow "xray 尚未安装！\n"
-    fi
-}
-
-# 重启 xray
-restart_xray() {
-    check_xray &>/dev/null
-    local status=$?
-    if [ $status -eq 0 ] || [ $status -eq 1 ]; then
-        yellow "\n正在重启 ${server_name} 服务\n"
-        launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
-        sleep 1
-        launchctl load -w "${launchd_dir}/com.xray.service.plist"
-        sleep 1
-        if launchctl list 2>/dev/null | grep -q "com.xray.service"; then
-            green "${server_name} 服务已成功重启\n"
-        else
-            red "${server_name} 服务重启失败\n"
-        fi
-    else
-        yellow "xray 尚未安装！\n"
-    fi
-}
-
-# 启动 argo
-start_argo() {
-    check_argo &>/dev/null
-    local status=$?
-    if [ $status -eq 1 ]; then
-        yellow "\n正在启动 Argo 服务\n"
-        launchctl load -w "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
-        sleep 1
-        green "Argo 服务已启动\n"
-    elif [ $status -eq 0 ]; then
-        green "Argo 服务正在运行\n"
-    else
-        yellow "Argo 尚未安装！\n"
-    fi
-}
-
-# 停止 argo
-stop_argo() {
-    check_argo &>/dev/null
-    local status=$?
-    if [ $status -eq 0 ]; then
-        yellow "\n正在停止 Argo 服务\n"
-        launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
-        sleep 1
-        green "Argo 服务已成功停止\n"
-    elif [ $status -eq 1 ]; then
-        yellow "Argo 服务未运行\n"
-    else
-        yellow "Argo 尚未安装！\n"
-    fi
-}
-
-# 重启 argo
-restart_argo() {
-    check_argo &>/dev/null
-    local status=$?
-    if [ $status -eq 0 ] || [ $status -eq 1 ]; then
-        yellow "\n正在重启 Argo 服务\n"
-        rm -f "${work_dir}/argo.log" 2>/dev/null
-        launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
-        sleep 1
-        launchctl load -w "${launchd_dir}/com.cloudflare.tunnel.plist"
-        sleep 1
-        green "Argo 服务已成功重启\n"
-    else
-        yellow "Argo 尚未安装！\n"
-    fi
-}
-
-# 启动 caddy
-start_caddy() {
-    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
-        yellow "\n正在启动 caddy 服务\n"
-        launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
-        launchctl load -w "${launchd_dir}/com.caddy.service.plist"
-        sleep 1
-        green "caddy 服务已启动\n"
-    else
-        yellow "caddy 尚未安装！\n"
-    fi
-}
-
-# 重启 caddy
-restart_caddy() {
-    if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
-        yellow "\n正在重启 caddy 服务\n"
-        launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
-        sleep 1
-        launchctl load -w "${launchd_dir}/com.caddy.service.plist"
-        sleep 1
-        green "caddy 服务已成功重启\n"
-    else
-        yellow "caddy 尚未安装！\n"
-    fi
-}
-
-# 卸载 xray
-uninstall_xray() {
-    reading "确定要卸载 xray-2go 吗? (y/n): " choice
-    case "${choice}" in
-        y|Y)
-            yellow "正在卸载 xray"
-            launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
-            launchctl unload "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null
-            launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
-
-            rm -f "${launchd_dir}/com.xray.service.plist"
-            rm -f "${launchd_dir}/com.cloudflare.tunnel.plist"
-            rm -f "${launchd_dir}/com.caddy.service.plist"
-
-            rm -f /usr/local/bin/2go 2>/dev/null
-
-            reading "\n是否卸载 caddy？(y/n): " choice
-            case "${choice}" in
-                y|Y) rm -f /usr/local/bin/caddy; green "caddy 已卸载" ;;
-                *) yellow "取消卸载 caddy\n" ;;
-            esac
-
-            reading "\n是否卸载 jq？(y/n): " choice
-            case "${choice}" in
-                y|Y) rm -f /usr/local/bin/jq; green "jq 已卸载" ;;
-                *) yellow "取消卸载 jq\n" ;;
-            esac
-
-            rm -rf "${work_dir}"
-
-            green "\nXray_2go 卸载成功\n"
-            ;;
-        *)
-            purple "已取消卸载操作\n"
-            ;;
-    esac
-}
-
-# 创建快捷指令
-create_shortcut() {
-    cat > "${work_dir}/2go.sh" << 'EOF'
-#!/usr/bin/env bash
-bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) $1
-EOF
-    chmod +x "${work_dir}/2go.sh"
-    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
-    ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go
-    if [ -f /usr/local/bin/2go ]; then
-        green "\n快捷指令 2go 创建成功\n"
-    else
-        red "\n快捷指令创建失败\n"
-    fi
-}
-
-# 变更配置
-change_config() {
-    load_ports
-    clear
-    echo ""
-    green "1. 修改UUID"
-    skyblue "------------"
-    green "2. 修改grpc-reality端口"
-    skyblue "------------"
-    green "3. 修改xhttp-reality端口"
-    skyblue "------------"
-    green "4. 修改reality节点伪装域名"
-    skyblue "------------"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "请输入选择: " choice
-    case "${choice}" in
-        1)
-            reading "\n请输入新的UUID: " new_uuid
-            [ -z "$new_uuid" ] && new_uuid=$(uuidgen | tr '[:upper:]' '[:lower:]') && green "\n生成的UUID为：$new_uuid"
-            sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$config_dir"
-            restart_xray
-            sed -i '' "s/[a-fA-F0-9]\{8\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{4\}-[a-fA-F0-9]\{12\}/$new_uuid/g" "$client_dir"
-            # 更新 ports.env 中的 UUID
-            sed -i '' "s/^UUID=.*/UUID=$new_uuid/" "${work_dir}/ports.env"
-            content=$(cat "$client_dir")
-            vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
-            vmess_prefix="vmess://"
-            for vmess_url in $vmess_urls; do
-                encoded_vmess="${vmess_url#"$vmess_prefix"}"
-                decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-                updated_vmess=$(echo "$decoded_vmess" | jq --arg new_uuid "$new_uuid" '.id = $new_uuid')
-                encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-                new_vmess_url="$vmess_prefix$encoded_updated_vmess"
-                content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-            done
-            echo "$content" > "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
-            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
-            rm -f "${work_dir}/sub_tmp.txt"
-            while IFS= read -r line; do yellow "$line"; done < "$client_dir"
-            green "\nUUID已修改为：${purple}${new_uuid}${re} ${green}请更新订阅或手动更改所有节点的UUID${re}\n"
-            ;;
-        2)
-            reading "\n请输入grpc-reality端口 (回车跳过将自动分配): " new_port
-            [ -z "$new_port" ] && new_port=$(find_available_port 2000 65000)
-            until [[ -z $(lsof -iTCP:$new_port -sTCP:LISTEN 2>/dev/null) ]]; do
-                echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-                reading "请输入新的端口(1-65535):" new_port
-                [[ -z $new_port ]] && new_port=$(find_available_port 2000 65000)
-            done
-            sed -i '' "41s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
-            sed -i '' "s/^GRPC_PORT=.*/GRPC_PORT=$new_port/" "${work_dir}/ports.env"
-            restart_xray
-            sed -i '' '1s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
-            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
-            rm -f "${work_dir}/sub_tmp.txt"
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nGRPC-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改grpc-reality节点端口${re}\n"
-            ;;
-        3)
-            reading "\n请输入xhttp-reality端口 (回车跳过将自动分配): " new_port
-            [ -z "$new_port" ] && new_port=$(find_available_port 2000 65000)
-            until [[ -z $(lsof -iTCP:$new_port -sTCP:LISTEN 2>/dev/null) ]]; do
-                echo -e "${red}${new_port}端口已经被其他程序占用，请更换端口重试${re}"
-                reading "请输入新的端口(1-65535):" new_port
-                [[ -z $new_port ]] && new_port=$(find_available_port 2000 65000)
-            done
-            sed -i '' "35s/\"port\":[[:space:]]*[0-9]*/\"port\": $new_port/" "${config_dir}"
-            sed -i '' "s/^XHTTP_PORT=.*/XHTTP_PORT=$new_port/" "${work_dir}/ports.env"
-            restart_xray
-            sed -i '' '3s/\(vless:\/\/[^@]*@[^:]*:\)[0-9]*/\1'"$new_port"'/' "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
-            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
-            rm -f "${work_dir}/sub_tmp.txt"
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nxhttp-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改xhttp-reality节点端口${re}\n"
-            ;;
-        4)
-            clear
-            green "\n1. bgk.jp\n\n2. www.joom.com\n\n3. www.stengg.com\n\n4. www.nazhumi.com\n"
-            reading "\n请输入新的Reality伪装域名(可自定义输入,回车留空将使用默认1): " new_sni
-            if [ -z "$new_sni" ]; then
-                new_sni="bgk.jp"
-            elif [[ "$new_sni" == "1" ]]; then
-                new_sni="bgk.jp"
-            elif [[ "$new_sni" == "2" ]]; then
-                new_sni="www.joom.com"
-            elif [[ "$new_sni" == "3" ]]; then
-                new_sni="www.stengg.com"
-            elif [[ "$new_sni" == "4" ]]; then
-                new_sni="www.nazhumi.com"
-            fi
-            jq --arg new_sni "$new_sni" '.inbounds[5].streamSettings.realitySettings.dest = ($new_sni + ":443") | .inbounds[5].streamSettings.realitySettings.serverNames = [$new_sni]' "${config_dir}" > "${config_dir}.tmp" && mv "${config_dir}.tmp" "${config_dir}"
-            restart_xray
-            sed -i '' "1s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" "$client_dir"
-            sed -i '' "1s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*authority=\)[^&]*/\1$new_sni/" "$client_dir"
-            base64 -i "$client_dir" -o "${work_dir}/sub_tmp.txt"
-            tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
-            rm -f "${work_dir}/sub_tmp.txt"
-            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            echo ""
-            green "\nReality sni已修改为：${purple}${new_sni}${re} ${green}请更新订阅或手动更改reality节点的sni域名${re}\n"
-            ;;
-        0) menu ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
-disable_open_sub() {
-    check_xray &>/dev/null
-    local xray_status=$?
-    if [ $xray_status -eq 0 ]; then
-        clear
-        echo ""
-        green "1. 关闭节点订阅"
-        skyblue "------------"
-        green "2. 开启节点订阅"
-        skyblue "------------"
-        green "3. 更换订阅端口"
-        skyblue "------------"
-        purple "4. 返回主菜单"
-        skyblue "------------"
-        reading "请输入选择: " choice
-        case "${choice}" in
-            1)
-                if command -v caddy &>/dev/null || [ -f /usr/local/bin/caddy ]; then
-                    launchctl unload "${launchd_dir}/com.caddy.service.plist" 2>/dev/null
-                    green "\n已关闭节点订阅\n"
-                else
-                    yellow "caddy is not installed"
-                fi
-                ;;
-            2)
-                green "\n已开启节点订阅\n"
-                server_ip=$(get_realip)
-                new_password=$(LC_ALL=C tr -dc A-Za-z < /dev/urandom | head -c 32)
-                sed -i '' "s/\/[a-zA-Z0-9]\{1,\}/\/$new_password/g" "${work_dir}/Caddyfile"
-                sub_port=$(grep -oE ':[0-9]+' "${work_dir}/Caddyfile" | head -1 | tr -d ':')
-                start_caddy
-                if [ "$sub_port" = "80" ]; then
-                    link="http://$server_ip/$new_password"
-                else
-                    green "订阅端口：$sub_port"
-                    link="http://$server_ip:$sub_port/$new_password"
-                fi
-                green "\n新的节点订阅链接：$link\n"
-                ;;
-            3)
-                reading "请输入新的订阅端口(1-65535):" sub_port
-                [ -z "$sub_port" ] && sub_port=$(find_available_port 2000 65000)
-                until [[ -z $(lsof -iTCP:$sub_port -sTCP:LISTEN 2>/dev/null) ]]; do
-                    echo -e "${red}${sub_port}端口已经被其他程序占用，请更换端口重试${re}"
-                    reading "请输入新的订阅端口(1-65535):" sub_port
-                    [[ -z $sub_port ]] && sub_port=$(find_available_port 2000 65000)
-                done
-                sed -i '' "s/:[0-9]\{1,\}/:$sub_port/g" "${work_dir}/Caddyfile"
-                # 更新 ports.env
-                sed -i '' "s/^PORT=.*/PORT=$sub_port/" "${work_dir}/ports.env"
-                path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile")
-                server_ip=$(get_realip)
-                restart_caddy
-                green "\n订阅端口更换成功\n"
-                green "新的订阅链接为：http://$server_ip:$sub_port/$path\n"
-                ;;
-            4) menu ;;
-            *) red "无效的选项！" ;;
-        esac
-    else
-        yellow "Xray-2go 尚未安装或未运行！"
-        sleep 1
-    fi
-}
-
-# xray 管理
-manage_xray() {
-    green "1. 启动xray服务"
-    skyblue "-------------------"
-    green "2. 停止xray服务"
-    skyblue "-------------------"
-    green "3. 重启xray服务"
-    skyblue "-------------------"
-    purple "4. 返回主菜单"
-    skyblue "------------"
-    reading "\n请输入选择: " choice
-    case "${choice}" in
-        1) start_xray ;;
-        2) stop_xray ;;
-        3) restart_xray ;;
-        4) menu ;;
-        *) red "无效的选项！" ;;
-    esac
-}
-
-# 获取 argo 临时隧道
-get_quick_tunnel() {
-    restart_argo
-    yellow "获取临时 argo 域名中，请稍等...\n"
-    sleep 5
-    if [ -f "${work_dir}/argo.log" ]; then
-        for i in {1..10}; do
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-            [ -n "$get_argodomain" ] && break
-            sleep 3
-        done
-    else
-        restart_argo
-        sleep 8
-        for i in {1..5}; do
-            get_argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
-            [ -n "$get_argodomain" ] && break
-            sleep 3
-        done
-    fi
-    if [ -n "$get_argodomain" ]; then
-        green "ArgoDomain：${purple}$get_argodomain${re}\n"
-    else
-        red "获取 Argo 域名失败，请检查网络后重试\n"
-    fi
-    ArgoDomain=$get_argodomain
-}
-
-# 更新 Argo 域名到订阅
-change_argo_domain() {
-    if [ -z "$ArgoDomain" ]; then
-        red "Argo 域名为空，无法更新"
-        return
-    fi
-    sed -i '' "5s/sni=[^&]*/sni=$ArgoDomain/" "${work_dir}/url.txt"
-    sed -i '' "5s/host=[^&]*/host=$ArgoDomain/" "${work_dir}/url.txt"
-    content=$(cat "$client_dir")
-    vmess_urls=$(grep -o 'vmess://[^ ]*' "$client_dir")
-    vmess_prefix="vmess://"
-    for vmess_url in $vmess_urls; do
-        encoded_vmess="${vmess_url#"$vmess_prefix"}"
-        decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-        updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
-        encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-        new_vmess_url="$vmess_prefix$encoded_updated_vmess"
-        content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-    done
-    echo "$content" > "$client_dir"
-    base64 -i "${work_dir}/url.txt" -o "${work_dir}/sub_tmp.txt"
-    tr -d '\n' < "${work_dir}/sub_tmp.txt" > "${work_dir}/sub.txt"
-    rm -f "${work_dir}/sub_tmp.txt"
-
-    while IFS= read -r line; do echo -e "${purple}$line"; done < "$client_dir"
-
-    green "\n节点已更新，更新订阅或手动复制以上节点\n"
-}
-
-# Argo 管理
-manage_argo() {
-    check_argo &>/dev/null
-    local argo_status=$?
-    if [ $argo_status -eq 2 ]; then
-        yellow "Argo 尚未安装！"
-        sleep 1
-        return
-    fi
-    clear
-    echo ""
-    green "1. 启动Argo服务"
-    skyblue "------------"
-    green "2. 停止Argo服务"
-    skyblue "------------"
-    green "3. 添加Argo固定隧道"
-    skyblue "----------------"
-    green "4. 切换回Argo临时隧道"
-    skyblue "------------------"
-    green "5. 重新获取Argo临时域名"
-    skyblue "-------------------"
-    purple "6. 返回主菜单"
-    skyblue "-----------"
-    reading "\n请输入选择: " choice
-    case "${choice}" in
-        1) start_argo ;;
-        2) stop_argo ;;
-        3)
-            clear
-            load_ports
-            yellow "\n固定隧道可为json或token，固定隧道端口为${ARGO_PORT}，自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
-            reading "\n请输入你的argo域名: " argo_domain
-            green "你的Argo域名为：$argo_domain"
-            ArgoDomain=$argo_domain
-            reading "\n请输入你的argo密钥(token或json): " argo_auth
-            if [[ $argo_auth =~ TunnelSecret ]]; then
-                echo $argo_auth > ${work_dir}/tunnel.json
-                cat > ${work_dir}/tunnel.yml << EOF
-tunnel: $(echo "$argo_auth" | cut -d\" -f12)
-credentials-file: ${work_dir}/tunnel.json
-protocol: http2
-
-ingress:
-  - hostname: $ArgoDomain
-    service: http://localhost:${ARGO_PORT}
-    originRequest:
-      noTLSVerify: true
-  - service: http_status:404
-EOF
-                cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << PEOF
+    cat > "${PLIST_DIR}/com.xray2go.tunnel.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.cloudflare.tunnel</string>
+    <string>com.xray2go.tunnel</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${work_dir}/argo</string>
-        <string>tunnel</string>
-        <string>--edge-ip-version</string>
-        <string>auto</string>
-        <string>--config</string>
-        <string>${work_dir}/tunnel.yml</string>
-        <string>run</string>
+        <string>${INSTALL_DIR}/argo</string>
+${tunnel_args}
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>${work_dir}/argo.log</string>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
     <key>StandardOutPath</key>
-    <string>${work_dir}/argo.log</string>
+    <string>${LOG_DIR}/argo.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/argo-error.log</string>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
 </dict>
 </plist>
-PEOF
-                restart_argo
-                change_argo_domain
-            elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
-                cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << PEOF
+EOF
+
+    # --- 订阅服务 ---
+    cat > "${PLIST_DIR}/com.xray2go.sub.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.cloudflare.tunnel</string>
+    <string>com.xray2go.sub</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${work_dir}/argo</string>
-        <string>tunnel</string>
-        <string>--edge-ip-version</string>
-        <string>auto</string>
-        <string>--no-autoupdate</string>
-        <string>--protocol</string>
-        <string>http2</string>
-        <string>run</string>
-        <string>--token</string>
-        <string>${argo_auth}</string>
+        <string>$(command -v python3)</string>
+        <string>${INSTALL_DIR}/sub_server.py</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <true/>
-    <key>StandardErrorPath</key>
-    <string>${work_dir}/argo.log</string>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
     <key>StandardOutPath</key>
-    <string>${work_dir}/argo.log</string>
+    <string>${LOG_DIR}/sub.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/sub-error.log</string>
+    <key>WorkingDirectory</key>
+    <string>${INSTALL_DIR}</string>
 </dict>
 </plist>
-PEOF
-                restart_argo
-                change_argo_domain
-            else
-                yellow "你输入的argo域名或token不匹配，请重新输入"
-                manage_argo
-            fi
-            ;;
-        4)
-            clear
-            load_ports
-            macos_launchd_services
-            get_quick_tunnel
-            change_argo_domain
-            ;;
-        5)
-            if grep -q "tunnel.yml" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null || grep -q "\-\-token" "${launchd_dir}/com.cloudflare.tunnel.plist" 2>/dev/null; then
-                yellow "当前使用固定隧道，无法获取临时隧道"
-                sleep 2
-            else
-                get_quick_tunnel
-                change_argo_domain
-            fi
-            ;;
-        6) menu ;;
-        *) red "无效的选项！" ;;
-    esac
+EOF
+
+    # --- 看门狗 ---
+    cat > "${PLIST_DIR}/com.xray2go.watchdog.plist" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xray2go.watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/watchdog.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/watchdog.log</string>
+</dict>
+</plist>
+EOF
+
+    log "INFO" "LaunchAgent plist 已生成"
 }
 
-# 查看节点信息和订阅链接
-check_nodes() {
-    check_xray &>/dev/null
-    local xray_status=$?
-    if [ $xray_status -eq 0 ]; then
-        load_ports
-        while IFS= read -r line; do purple "$line"; done < ${work_dir}/url.txt
-        server_ip=$(get_realip)
-        sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
-        lujing=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
-        if [ -n "$sub_port" ] && [ -n "$lujing" ]; then
-            green "\n\n节点订阅链接：http://$server_ip:$sub_port/$lujing\n"
-        else
-            yellow "\n\n订阅信息获取失败，请检查 Caddy 配置\n"
-        fi
-    else
-        yellow "Xray-2go 尚未安装或未运行，请先安装或启动 Xray-2go"
-        sleep 1
-    fi
-}
-
-# 捕获 Ctrl+C 信号
-trap 'red "已取消操作"; exit' INT
-
-# 主菜单
-menu() {
-    while true; do
-        check_xray &>/dev/null; local check_xray_ret=$?
-        check_caddy &>/dev/null; local check_caddy_ret=$?
-        check_argo &>/dev/null; local check_argo_ret=$?
-        check_xray_status=$(check_xray 2>/dev/null)
-        check_caddy_status=$(check_caddy 2>/dev/null)
-        check_argo_status=$(check_argo 2>/dev/null)
-        clear
-        echo ""
-        purple "=== 老王Xray-2go一键安装脚本 (macOS版) ===\n"
-        purple " Xray 状态: ${check_xray_status}\n"
-        purple " Argo 状态: ${check_argo_status}\n"
-        purple "Caddy 状态: ${check_caddy_status}\n"
-        green "1. 安装Xray-2go"
-        red "2. 卸载Xray-2go"
-        echo "==============="
-        green "3. Xray-2go管理"
-        green "4. Argo隧道管理"
-        echo "==============="
-        green "5. 查看节点信息"
-        green "6. 修改节点配置"
-        green "7. 管理节点订阅"
-        echo "==============="
-        skyblue "8. 导出代理为txt"
-        echo "==============="
-        red "0. 退出脚本"
-        echo "==========="
-        reading "请输入选择(0-8): " choice
-        echo ""
-        case "${choice}" in
-            1)
-                if [ $check_xray_ret -eq 0 ]; then
-                    yellow "Xray-2go 已经安装！"
-                else
-                    install_caddy
-                    manage_packages install jq qrencode
-                    install_xray
-                    macos_launchd_services
-                    sleep 3
-                    get_info
-                    add_caddy_conf
-                    create_shortcut
-                fi
-                ;;
-            2) uninstall_xray ;;
-            3) manage_xray ;;
-            4) manage_argo ;;
-            5) check_nodes ;;
-            6) change_config ;;
-            7) disable_open_sub ;;
-            8) export_menu ;;
-            0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 8" ;;
-        esac
-        read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
+load_launch_agents() {
+    log "STEP" "加载 LaunchAgent"
+    local plists=(
+        "com.xray2go.xray"
+        "com.xray2go.tunnel"
+        "com.xray2go.sub"
+        "com.xray2go.watchdog"
+    )
+    for label in "${plists[@]}"; do
+        launchctl unload "${PLIST_DIR}/${label}.plist" 2>/dev/null || true
+        launchctl load -w "${PLIST_DIR}/${label}.plist" 2>/dev/null && \
+            log "INFO" "已加载: ${label}" || \
+            log "WARN" "加载失败: ${label}"
     done
 }
 
-menu
+unload_launch_agents() {
+    local plists=(
+        "com.xray2go.xray"
+        "com.xray2go.tunnel"
+        "com.xray2go.sub"
+        "com.xray2go.watchdog"
+    )
+    for label in "${plists[@]}"; do
+        launchctl unload "${PLIST_DIR}/${label}.plist" 2>/dev/null || true
+        rm -f "${PLIST_DIR}/${label}.plist"
+    done
+    log "INFO" "LaunchAgent 已全部卸载"
+}
 
+# ============================================================
+# 看门狗脚本（含 plist 自愈）
+# ============================================================
+generate_watchdog() {
+    log "STEP" "生成看门狗脚本"
+
+    cat > "${INSTALL_DIR}/watchdog.sh" << 'WDEOF'
+#!/bin/bash
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+LOG_DIR="${INSTALL_DIR}/logs"
+LOG="${LOG_DIR}/watchdog.log"
+
+mkdir -p "$LOG_DIR"
+
+# 日志轮转 2MB
+if [[ -f "$LOG" ]]; then
+    size=$(stat -f%z "$LOG" 2>/dev/null || echo 0)
+    if [[ $size -gt 2097152 ]]; then
+        tail -200 "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+    fi
+fi
+
+wlog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG"; }
+
+[[ -f "${INSTALL_DIR}/ports.env" ]] && source "${INSTALL_DIR}/ports.env"
+
+rebuild_plist() {
+    local label="$1"
+    local plist_file="${PLIST_DIR}/${label}.plist"
+    wlog "ALERT: ${label}.plist 丢失，正在重建..."
+
+    case "$label" in
+        com.xray2go.xray)
+            cat > "$plist_file" << PEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/xray</string>
+        <string>run</string><string>-c</string>
+        <string>${INSTALL_DIR}/config.json</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>3</integer>
+    <key>StandardOutPath</key><string>${LOG_DIR}/xray.log</string>
+    <key>StandardErrorPath</key><string>${LOG_DIR}/xray-error.log</string>
+</dict>
+</plist>
+PEOF
+            ;;
+        com.xray2go.tunnel)
+            local t_args
+            if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+                t_args="<string>tunnel</string><string>--no-autoupdate</string><string>run</string><string>--token</string><string>${CF_TUNNEL_TOKEN}</string>"
+            else
+                t_args="<string>tunnel</string><string>--url</string><string>http://localhost:${ARGO_PORT}</string><string>--no-autoupdate</string><string>--edge-ip-version</string><string>auto</string><string>--protocol</string><string>http2</string>"
+            fi
+            cat > "$plist_file" << PEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${INSTALL_DIR}/argo</string>
+        ${t_args}
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>StandardOutPath</key><string>${LOG_DIR}/argo.log</string>
+    <key>StandardErrorPath</key><string>${LOG_DIR}/argo-error.log</string>
+</dict>
+</plist>
+PEOF
+            ;;
+        com.xray2go.watchdog)
+            cat > "$plist_file" << PEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>${label}</string>
+    <key>ProgramArguments</key>
+    <array><string>${INSTALL_DIR}/watchdog.sh</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>StartInterval</key><integer>60</integer>
+    <key>StandardOutPath</key><string>${LOG_DIR}/watchdog.log</string>
+    <key>StandardErrorPath</key><string>${LOG_DIR}/watchdog.log</string>
+</dict>
+</plist>
+PEOF
+            ;;
+    esac
+
+    launchctl load -w "$plist_file" 2>/dev/null && \
+        wlog "REPAIR: ${label} 已重建并加载" || \
+        wlog "ERROR: ${label} 加载失败"
+}
+
+# === 检查 1: Xray 进程 ===
+if ! pgrep -f "${INSTALL_DIR}/xray" >/dev/null 2>&1; then
+    wlog "ALERT: Xray 进程不存在"
+    if [[ -f "${PLIST_DIR}/com.xray2go.xray.plist" ]]; then
+        launchctl unload "${PLIST_DIR}/com.xray2go.xray.plist" 2>/dev/null
+        launchctl load -w "${PLIST_DIR}/com.xray2go.xray.plist" 2>/dev/null
+        wlog "REPAIR: 重新加载 xray LaunchAgent"
+    else
+        nohup "${INSTALL_DIR}/xray" run -c "${INSTALL_DIR}/config.json" \
+            >> "${LOG_DIR}/xray.log" 2>&1 &
+        wlog "REPAIR: 直接启动 xray PID=$!"
+    fi
+    sleep 2
+fi
+
+# === 检查 2: Xray 端口 ===
+if [[ -n "${ARGO_PORT:-}" ]]; then
+    if ! lsof -iTCP:${ARGO_PORT} -sTCP:LISTEN >/dev/null 2>&1; then
+        wlog "ALERT: Xray 端口 ${ARGO_PORT} 未监听，强制重启"
+        pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
+        sleep 3
+    fi
+fi
+
+# === 检查 3: Tunnel 进程 ===
+if ! pgrep -f "${INSTALL_DIR}/argo" >/dev/null 2>&1; then
+    wlog "ALERT: Tunnel 进程不存在"
+    if [[ -f "${PLIST_DIR}/com.xray2go.tunnel.plist" ]]; then
+        launchctl unload "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null
+        launchctl load -w "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null
+        wlog "REPAIR: 重新加载 tunnel LaunchAgent"
+    else
+        if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+            nohup "${INSTALL_DIR}/argo" tunnel --no-autoupdate run \
+                --token "${CF_TUNNEL_TOKEN}" \
+                >> "${LOG_DIR}/argo.log" 2>&1 &
+        else
+            nohup "${INSTALL_DIR}/argo" tunnel \
+                --url "http://localhost:${ARGO_PORT}" \
+                --no-autoupdate --edge-ip-version auto --protocol http2 \
+                >> "${LOG_DIR}/argo.log" 2>&1 &
+        fi
+        wlog "REPAIR: 直接启动 tunnel PID=$!"
+    fi
+fi
+
+# === 检查 4: plist 自愈 ===
+for label in com.xray2go.xray com.xray2go.tunnel com.xray2go.watchdog; do
+    [[ ! -f "${PLIST_DIR}/${label}.plist" ]] && rebuild_plist "$label"
+done
+
+# === 检查 5: cron 自愈 ===
+if command -v crontab &>/dev/null; then
+    if ! crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
+        (crontab -l 2>/dev/null; \
+         echo "* * * * * ${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab -
+        wlog "REPAIR: cron 看门狗已恢复"
+    fi
+    if ! crontab -l 2>/dev/null | grep -q "xray-boot.sh"; then
+        (crontab -l 2>/dev/null; \
+         echo "@reboot sleep 15 && ${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab -
+        wlog "REPAIR: cron @reboot 已恢复"
+    fi
+fi
+WDEOF
+
+    chmod +x "${INSTALL_DIR}/watchdog.sh"
+    log "INFO" "看门狗脚本已生成"
+}
+
+# ============================================================
+# 开机启动脚本（多路径冗余）
+# ============================================================
+generate_boot_script() {
+    log "STEP" "配置多路径开机自启"
+
+    # --- 通用启动脚本 ---
+    cat > "${INSTALL_DIR}/xray-boot.sh" << 'BOOTEOF'
+#!/bin/bash
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLIST_DIR="${HOME}/Library/LaunchAgents"
+LOG_DIR="${INSTALL_DIR}/logs"
+LOG="${LOG_DIR}/boot.log"
+
+mkdir -p "$LOG_DIR"
+wlog() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] BOOT: $1" >> "$LOG"; }
+wlog "启动脚本执行"
+
+[[ -f "${INSTALL_DIR}/ports.env" ]] && source "${INSTALL_DIR}/ports.env"
+
+# 等待网络
+for i in $(seq 1 30); do
+    if ping -c 1 -W 2 1.1.1.1 >/dev/null 2>&1; then
+        wlog "网络就绪 (${i}次)"
+        break
+    fi
+    sleep 2
+done
+
+# 优先通过 launchctl
+for label in com.xray2go.xray com.xray2go.tunnel com.xray2go.sub com.xray2go.watchdog; do
+    if [[ -f "${PLIST_DIR}/${label}.plist" ]]; then
+        launchctl load -w "${PLIST_DIR}/${label}.plist" 2>/dev/null
+        wlog "launchctl 加载: ${label}"
+    fi
+done
+
+# 等待启动
+sleep 3
+
+# 兜底：进程不存在则直接启动
+if ! pgrep -f "${INSTALL_DIR}/xray" >/dev/null 2>&1; then
+    nohup "${INSTALL_DIR}/xray" run -c "${INSTALL_DIR}/config.json" \
+        >> "${LOG_DIR}/xray.log" 2>&1 &
+    wlog "兜底启动 xray PID=$!"
+fi
+
+if ! pgrep -f "${INSTALL_DIR}/argo" >/dev/null 2>&1; then
+    if [[ -n "${CF_TUNNEL_TOKEN:-}" ]]; then
+        nohup "${INSTALL_DIR}/argo" tunnel --no-autoupdate run \
+            --token "${CF_TUNNEL_TOKEN}" \
+            >> "${LOG_DIR}/argo.log" 2>&1 &
+    else
+        nohup "${INSTALL_DIR}/argo" tunnel \
+            --url "http://localhost:${ARGO_PORT}" \
+            --no-autoupdate --edge-ip-version auto --protocol http2 \
+            >> "${LOG_DIR}/argo.log" 2>&1 &
+    fi
+    wlog "兜底启动 tunnel PID=$!"
+fi
+
+wlog "启动脚本完毕"
+BOOTEOF
+
+    chmod +x "${INSTALL_DIR}/xray-boot.sh"
+
+    # === 路径 2: crontab ===
+    if command -v crontab &>/dev/null; then
+        local cron_now
+        cron_now=$(crontab -l 2>/dev/null || echo "")
+
+        local new_cron="$cron_now"
+        [[ "$new_cron" != *"xray-boot.sh"* ]] && \
+            new_cron="${new_cron}"$'\n'"@reboot sleep 15 && ${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1"
+        [[ "$new_cron" != *"watchdog.sh"* ]] && \
+            new_cron="${new_cron}"$'\n'"* * * * * ${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1"
+        [[ "$new_cron" != *"log-clean.sh"* ]] && \
+            new_cron="${new_cron}"$'\n'"0 */6 * * * ${INSTALL_DIR}/log-clean.sh >/dev/null 2>&1"
+
+        echo "$new_cron" | grep -v '^[[:space:]]*$' | crontab -
+        log "INFO" "crontab 已配置 (层2)"
+    fi
+
+    # === 路径 3: zsh/bash profile ===
+    for profile in "${HOME}/.zprofile" "${HOME}/.zshrc" \
+                   "${HOME}/.bash_profile" "${HOME}/.bashrc"; do
+        if [[ -f "$profile" ]] || [[ "$profile" == "${HOME}/.zprofile" ]]; then
+            if ! grep -q "xray2go-check" "$profile" 2>/dev/null; then
+                cat >> "$profile" << PROF
+
+# xray2go-check
+(pgrep -f "${INSTALL_DIR}/xray" >/dev/null 2>&1 || \
+    "${INSTALL_DIR}/xray-boot.sh" &) >/dev/null 2>&1 &
+PROF
+                log "INFO" "已写入 ${profile} (层3)"
+            fi
+        fi
+    done
+
+    # === 路径 4: Login Item (osascript) ===
+    cat > "${INSTALL_DIR}/xray-login.command" << EOF
+#!/bin/bash
+"${INSTALL_DIR}/xray-boot.sh"
+EOF
+    chmod +x "${INSTALL_DIR}/xray-login.command"
+
+    osascript -e "
+        tell application \"System Events\"
+            try
+                delete login item \"xray2go\"
+            end try
+            try
+                make login item at end with properties ¬
+                    {path:\"${INSTALL_DIR}/xray-login.command\", ¬
+                     hidden:true, name:\"xray2go\"}
+            end try
+        end tell
+    " 2>/dev/null && log "INFO" "Login Item 已添加 (层4)" || \
+        log "WARN" "Login Item 需要用户手动授权（系统设置 > 通用 > 登录项）"
+
+    log "INFO" "多路径开机自启配置完成"
+}
+
+# ============================================================
+# 日志管理
+# ============================================================
+generate_log_cleaner() {
+    cat > "${INSTALL_DIR}/log-clean.sh" << 'LCEOF'
+#!/bin/bash
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+LOG_DIR="${INSTALL_DIR}/logs"
+MAX_SIZE=52428800  # 50MB
+
+for logfile in "${LOG_DIR}"/*.log; do
+    [[ -f "$logfile" ]] || continue
+    size=$(stat -f%z "$logfile" 2>/dev/null || echo 0)
+    if [[ $size -gt $MAX_SIZE ]]; then
+        tail -1000 "$logfile" > "${logfile}.tmp"
+        mv "${logfile}.tmp" "$logfile"
+    fi
+done
+LCEOF
+    chmod +x "${INSTALL_DIR}/log-clean.sh"
+}
+
+# ============================================================
+# Cloudflare 固定隧道
+# ============================================================
 setup_fixed_tunnel() {
-    echo "配置 Cloudflare 固定隧道..."
+    log "STEP" "配置 Cloudflare 固定隧道"
+
+    [[ -f "${INSTALL_DIR}/.env" ]] && source "${INSTALL_DIR}/.env"
+
+    if [[ -z "${CF_API_TOKEN:-}" ]]; then
+        read -rp "CF_API_TOKEN: " CF_API_TOKEN
+        [[ -z "$CF_API_TOKEN" ]] && die "CF_API_TOKEN 不能为空"
+    fi
+    if [[ -z "${CF_ACCOUNT_ID:-}" ]]; then
+        read -rp "CF_ACCOUNT_ID: " CF_ACCOUNT_ID
+        [[ -z "$CF_ACCOUNT_ID" ]] && die "CF_ACCOUNT_ID 不能为空"
+    fi
+
+    CF_TUNNEL_NAME="${CF_TUNNEL_NAME:-xray-$(hostname -s)-$(date +%s)}"
+    local API_BASE="https://api.cloudflare.com/client/v4"
+    local tunnel_secret
+    tunnel_secret=$(openssl rand -base64 32)
+
+    local create_resp
+    create_resp=$(curl -s -X POST "${API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"${CF_TUNNEL_NAME}\",\"tunnel_secret\":\"${tunnel_secret}\"}")
+
+    local success
+    success=$(echo "$create_resp" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('success',False))" 2>/dev/null)
+    [[ "$success" != "True" ]] && die "创建隧道失败: $(echo "$create_resp" | head -c 200)"
+
+    local TUNNEL_ID
+    TUNNEL_ID=$(echo "$create_resp" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin)['result']['id'])")
+    log "INFO" "隧道创建成功 ID: ${TUNNEL_ID}"
+
+    source "${INSTALL_DIR}/ports.env"
+    local cfg
+    if [[ -n "${CF_TUNNEL_DOMAIN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
+        cfg="{\"config\":{\"originRequest\":{},\"warp-routing\":{\"enabled\":false},\"ingress\":[{\"hostname\":\"${CF_TUNNEL_DOMAIN}\",\"service\":\"http://localhost:${ARGO_PORT}\",\"originRequest\":{}},{\"service\":\"http_status:404\"}]}}"
+    else
+        cfg="{\"config\":{\"originRequest\":{},\"warp-routing\":{\"enabled\":false},\"ingress\":[{\"service\":\"http://localhost:${ARGO_PORT}\"}]}}"
+    fi
+
+    curl -s -X PUT "${API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -d "$cfg" >/dev/null
+
+    local token_resp tunnel_token
+    token_resp=$(curl -s "${API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/token" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}")
+    tunnel_token=$(echo "$token_resp" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin)['result'])" 2>/dev/null)
+    [[ -z "$tunnel_token" || "$tunnel_token" == "None" ]] && die "获取 Token 失败"
+
+    if [[ -n "${CF_TUNNEL_DOMAIN:-}" && -n "${CF_ZONE_ID:-}" ]]; then
+        curl -s -X POST "${API_BASE}/zones/${CF_ZONE_ID}/dns_records" \
+            -H "Authorization: Bearer ${CF_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"type\":\"CNAME\",\"name\":\"${CF_TUNNEL_DOMAIN}\",\"content\":\"${TUNNEL_ID}.cfargotunnel.com\",\"proxied\":true}" \
+            >/dev/null && log "INFO" "DNS CNAME 已创建"
+    fi
+
+    # 更新配置
+    local argo_domain="${CF_TUNNEL_DOMAIN:-${TUNNEL_ID}.cfargotunnel.com}"
+    sed -i '' "s|^CF_TUNNEL_TOKEN=.*|CF_TUNNEL_TOKEN=${tunnel_token}|" "${INSTALL_DIR}/ports.env"
+    sed -i '' "s|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=${TUNNEL_ID}|" "${INSTALL_DIR}/ports.env"
+    sed -i '' "s|^CF_TUNNEL_NAME=.*|CF_TUNNEL_NAME=${CF_TUNNEL_NAME}|" "${INSTALL_DIR}/ports.env"
+    sed -i '' "s|^ARGO_DOMAIN=.*|ARGO_DOMAIN=${argo_domain}|" "${INSTALL_DIR}/ports.env"
+
+    cat > "${INSTALL_DIR}/.env" << ENVEOF
+CF_API_TOKEN=${CF_API_TOKEN}
+CF_ACCOUNT_ID=${CF_ACCOUNT_ID}
+CF_ZONE_ID=${CF_ZONE_ID:-}
+CF_TUNNEL_NAME=${CF_TUNNEL_NAME}
+ENVEOF
+    chmod 600 "${INSTALL_DIR}/.env"
+
+    # 重新生成并加载 tunnel plist
+    generate_launch_agents
+    launchctl unload "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null || true
+    launchctl load -w "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null
+
+    log "INFO" "固定隧道配置完成: ${argo_domain}"
 }
+
 delete_fixed_tunnel() {
-    echo "删除固定隧道..."
+    log "STEP" "删除固定隧道"
+    [[ -f "${INSTALL_DIR}/.env" ]] && source "${INSTALL_DIR}/.env"
+    source "${INSTALL_DIR}/ports.env"
+
+    [[ -z "${CF_API_TOKEN:-}" || -z "${CF_ACCOUNT_ID:-}" || -z "${CF_TUNNEL_ID:-}" ]] && \
+        die "缺少 CF_API_TOKEN / CF_ACCOUNT_ID / CF_TUNNEL_ID"
+
+    local API_BASE="https://api.cloudflare.com/client/v4"
+    launchctl unload "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null || true
+
+    curl -s -X DELETE "${API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}/connections" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json" >/dev/null
+    sleep 2
+
+    local resp
+    resp=$(curl -s -X DELETE \
+        "${API_BASE}/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${CF_TUNNEL_ID}" \
+        -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        -H "Content-Type: application/json")
+
+    local success
+    success=$(echo "$resp" | python3 -c \
+        "import sys,json; print(json.load(sys.stdin).get('success',False))" 2>/dev/null)
+
+    if [[ "$success" == "True" ]]; then
+        sed -i '' 's|^CF_TUNNEL_TOKEN=.*|CF_TUNNEL_TOKEN=|' "${INSTALL_DIR}/ports.env"
+        sed -i '' 's|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=|' "${INSTALL_DIR}/ports.env"
+        sed -i '' 's|^ARGO_DOMAIN=.*|ARGO_DOMAIN=|' "${INSTALL_DIR}/ports.env"
+        log "INFO" "固定隧道已删除"
+    else
+        log "ERROR" "删除失败: $(echo "$resp" | head -c 200)"
+    fi
 }
+
+# ============================================================
+# 节点信息
+# ============================================================
+get_argo_domain() {
+    source "${INSTALL_DIR}/ports.env"
+    if [[ -n "${CF_TUNNEL_DOMAIN:-}" ]]; then
+        echo "${CF_TUNNEL_DOMAIN}"
+    elif [[ -n "${CF_TUNNEL_ID:-}" ]]; then
+        echo "${CF_TUNNEL_ID}.cfargotunnel.com"
+    elif [[ -n "${ARGO_DOMAIN:-}" ]]; then
+        echo "${ARGO_DOMAIN}"
+    else
+        grep -h "trycloudflare" "${LOG_DIR}/argo.log" "${LOG_DIR}/argo-error.log" 2>/dev/null | \
+            grep -oE '[a-z0-9\-]+\.trycloudflare\.com' | tail -1
+    fi
+}
+
+print_node_info() {
+    source "${INSTALL_DIR}/ports.env"
+    local IP
+    IP=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null || \
+         curl -s4 --max-time 5 ip.sb 2>/dev/null || echo "unknown")
+    local ARGO_DOMAIN
+    ARGO_DOMAIN=$(get_argo_domain)
+    local N="$IP"
+
+    echo ""
+    echo "╔══════════════════════════════════════════╗"
+    echo "║       Xray-2go macOS 节点信息            ║"
+    echo "╠══════════════════════════════════════════╣"
+    printf "║  时间:    %-32s║\n" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf "║  系统:    %-32s║\n" "macOS $(get_macos_version) ($(get_arch))"
+    printf "║  服务器:  %-32s║\n" "${IP}"
+    echo "╠══════════════════════════════════════════╣"
+    echo "║  端口信息                                ║"
+    printf "║  订阅:%-6s  Argo:%-6s  GRPC:%-6s  ║\n" "$SUB_PORT" "$ARGO_PORT" "$GRPC_PORT"
+    printf "║  XHTTP:%-5s  Vision:%-4s  SS:%-7s  ║\n" "$XHTTP_PORT" "$VISION_PORT" "$SS_PORT"
+    printf "║  XHTTP-H3: %-31s║\n" "$XHTTP_H3_PORT"
+    echo "╠══════════════════════════════════════════╣"
+    printf "║  UUID: %-34s║\n" "${UUID:0:34}"
+    printf "║        %-34s║\n" "${UUID:34}"
+    printf "║  PubKey: %-32s║\n" "${public_key:0:32}"
+    printf "║  Argo: %-34s║\n" "${ARGO_DOMAIN:-未获取}"
+    echo "╚══════════════════════════════════════════╝"
+    echo ""
+    echo "=========================================="
+    echo "  节点链接"
+    echo "=========================================="
+    echo ""
+
+    echo "--- 1. VLESS TCP Vision Reality ---"
+    echo "vless://${UUID}@${IP}:${VISION_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${public_key}&type=tcp#${N}-Vision-Reality"
+    echo ""
+
+    echo "--- 2. VLESS XHTTP Reality ---"
+    echo "vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${N}-XHTTP-Reality"
+    echo ""
+
+    echo "--- 3. VLESS gRPC Reality ---"
+    echo "vless://${UUID}@${IP}:${GRPC_PORT}?encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${N}-gRPC-Reality"
+    echo ""
+
+    echo "--- 4. VLESS XHTTP H3 Reality ---"
+    echo "vless://${UUID}@${IP}:${XHTTP_H3_PORT}?encryption=none&security=reality&sni=www.apple.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${N}-XHTTP-H3-Reality"
+    echo ""
+
+    echo "--- 5. Shadowsocks 2022 ---"
+    local ss_b64
+    ss_b64=$(python3 -c \
+        "import base64; print(base64.b64encode(b'2022-blake3-aes-128-gcm:${ss_password}').decode())")
+    echo "ss://${ss_b64}@${IP}:${SS_PORT}#${N}-SS2022"
+    echo ""
+
+    if [[ -n "${ARGO_DOMAIN:-}" ]]; then
+        echo "--- 6. VLESS WS Argo ---"
+        echo "vless://${UUID}@${CDN_HOST}:443?encryption=none&security=tls&sni=${ARGO_DOMAIN}&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=%2Fvless-argo%3Fed%3D2560#${N}-VLESS-WS-Argo"
+        echo ""
+
+        echo "--- 7. VMess WS Argo ---"
+        local vmess_json="{\"v\":\"2\",\"ps\":\"${N}-VMess-WS-Argo\",\"add\":\"${CDN_HOST}\",\"port\":\"443\",\"id\":\"${UUID}\",\"aid\":\"0\",\"scy\":\"none\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"${ARGO_DOMAIN}\",\"path\":\"/vmess-argo?ed=2560\",\"tls\":\"tls\",\"sni\":\"${ARGO_DOMAIN}\",\"alpn\":\"\",\"fp\":\"chrome\"}"
+        echo "vmess://$(python3 -c "import base64,sys; print(base64.b64encode('''${vmess_json}'''.encode()).decode())")"
+        echo ""
+
+        echo "--- 8. Trojan WS Argo ---"
+        echo "trojan://${trojan_password}@${CDN_HOST}:443?security=tls&sni=${ARGO_DOMAIN}&fp=chrome&type=ws&host=${ARGO_DOMAIN}&path=%2Ftrojan-argo%3Fed%3D2560#${N}-Trojan-WS-Argo"
+        echo ""
+    fi
+
+    echo "=========================================="
+    echo "  订阅链接"
+    echo "=========================================="
+    echo "http://${IP}:${SUB_PORT}/${SUB_TOKEN}"
+    echo ""
+}
+
+# ============================================================
+# 不死鸟持久化主函数
+# ============================================================
+setup_immortal() {
+    log "STEP" "安装 macOS 不死鸟持久化"
+
+    generate_watchdog
+    generate_log_cleaner
+    generate_launch_agents
+    load_launch_agents
+    generate_boot_script
+
+    echo ""
+    echo "  🐦‍🔥 macOS 不死鸟持久化已激活！"
+    echo ""
+    echo "  防护层:"
+    echo "  ✅ 层1: LaunchAgent (KeepAlive + RunAtLoad + NetworkState)"
+    echo "  ✅ 层2: cron 看门狗 (每分钟)"
+    echo "  ✅ 层3: shell profile 登录检查 (.zprofile)"
+    echo "  ✅ 层4: Login Item (系统登录项)"
+    echo "  ✅ 层5: plist 自愈 (被删自动重建)"
+    echo "  ✅ 层6: cron 条目自愈"
+    echo "  ✅ 日志自动清理 (每6小时)"
+    echo ""
+    echo "  管理命令:"
+    echo "  查看状态:  launchctl list | grep xray2go"
+    echo "  查看日志:  tail -f ${LOG_DIR}/xray.log"
+    echo "  手动停止:  launchctl unload ~/Library/LaunchAgents/com.xray2go.*.plist"
+    echo ""
+}
+
+# ============================================================
+# 状态查看
+# ============================================================
+show_status() {
+    echo ""
+    echo "=== LaunchAgent 状态 ==="
+    launchctl list | grep "xray2go" || echo "  未发现 LaunchAgent"
+
+    echo ""
+    echo "=== 进程状态 ==="
+    pgrep -fl "xray" | grep "${INSTALL_DIR}" || echo "  Xray: 未运行"
+    pgrep -fl "argo" | grep "${INSTALL_DIR}" || echo "  Tunnel: 未运行"
+    pgrep -fl "sub_server" | grep "${INSTALL_DIR}" || echo "  Sub: 未运行"
+
+    echo ""
+    echo "=== 端口监听 ==="
+    source "${INSTALL_DIR}/ports.env" 2>/dev/null
+    for port in "${ARGO_PORT:-}" "${VISION_PORT:-}" "${SS_PORT:-}" "${SUB_PORT:-}"; do
+        [[ -z "$port" ]] && continue
+        if lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "  :${port} ✅ 监听中"
+        else
+            echo "  :${port} ❌ 未监听"
+        fi
+    done
+
+    echo ""
+    echo "=== cron 条目 ==="
+    crontab -l 2>/dev/null | grep -E "xray|watchdog|argo" || echo "  无相关 cron 条目"
+    echo ""
+}
+
+# ============================================================
+# 完整安装
+# ============================================================
+do_install() {
+    log "STEP" "==== Xray-2go macOS 安装开始 ===="
+    log "INFO" "安装目录: ${INSTALL_DIR}"
+    log "INFO" "macOS $(get_macos_version) $(get_arch)"
+
+    check_macos_version
+    check_deps
+
+    mkdir -p "$INSTALL_DIR" "$LOG_DIR"
+    chmod 700 "$INSTALL_DIR"
+
+    generate_ports
+    download_xray
+    download_argo
+    generate_keys
+    save_ports_env
+    generate_config
+    generate_sub_server
+    setup_immortal
+
+    # 等待 Argo 域名
+    log "INFO" "等待 Argo 域名 (最多 40 秒)..."
+    local domain=""
+    for i in $(seq 1 20); do
+        domain=$(grep -h "trycloudflare" \
+            "${LOG_DIR}/argo.log" "${LOG_DIR}/argo-error.log" 2>/dev/null | \
+            grep -oE '[a-z0-9\-]+\.trycloudflare\.com' | tail -1)
+        [[ -n "$domain" ]] && break
+        sleep 2
+    done
+
+    if [[ -n "$domain" ]]; then
+        sed -i '' "s|^ARGO_DOMAIN=.*|ARGO_DOMAIN=${domain}|" "${INSTALL_DIR}/ports.env"
+        log "INFO" "Argo 域名: ${domain}"
+    else
+        log "WARN" "未获取到 Argo 域名，稍后可通过菜单选项 3 查看"
+    fi
+
+    print_node_info
+    log "INFO" "==== macOS 安装完成 ===="
+}
+
+# ============================================================
+# 完整卸载
+# ============================================================
+do_uninstall() {
+    log "STEP" "开始卸载..."
+
+    # 停止进程
+    pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
+    pkill -f "${INSTALL_DIR}/argo" 2>/dev/null || true
+
+    # 卸载 LaunchAgents
+    unload_launch_agents
+
+    # 清理 crontab
+    if command -v crontab &>/dev/null; then
+        crontab -l 2>/dev/null | \
+            grep -v "xray" | grep -v "watchdog" | grep -v "log-clean" | \
+            crontab - 2>/dev/null || true
+    fi
+
+    # 清理 shell profile
+    for profile in "${HOME}/.zprofile" "${HOME}/.zshrc" \
+                   "${HOME}/.bash_profile" "${HOME}/.bashrc"; do
+        if [[ -f "$profile" ]]; then
+            local tmp
+            tmp=$(mktemp)
+            # 删除 xray2go-check 块（注释行 + 后续 2 行）
+            awk '/# xray2go-check/{skip=3} skip>0{skip--; next} 1' "$profile" > "$tmp"
+            mv "$tmp" "$profile"
+        fi
+    done
+
+    # 移除 Login Item
+    osascript -e '
+        tell application "System Events"
+            try
+                delete login item "xray2go"
+            end try
+        end tell
+    ' 2>/dev/null || true
+
+    # 删除安装目录
+    rm -rf "$INSTALL_DIR"
+
+    echo ""
+    echo "  🧹 macOS 卸载完成"
+    echo "  所有 LaunchAgent / cron / profile / Login Item 已清除"
+    echo ""
+}
+
+# ============================================================
+# 菜单
+# ============================================================
+show_menu() {
+    clear
+    echo ""
+    echo "  ╔════════════════════════════════╗"
+    echo "  ║   Xray-2go macOS v${SCRIPT_VERSION}        ║"
+    echo "  ║   $(get_macos_version) $(get_arch)          ║"
+    echo "  ╚════════════════════════════════╝"
+    echo ""
+    echo "  1) 安装"
+    echo "  2) 卸载"
+    echo "  3) 显示节点信息"
+    echo "  4) 重启所有服务"
+    echo "  5) 查看状态"
+    echo "  6) 配置 CF 固定隧道"
+    echo "  7) 删除 CF 固定隧道"
+    echo "  8) 切换回临时隧道"
+    echo "  9) 更新 Xray"
+    echo "  0) 退出"
+    echo ""
+    read -rp "  请选择: " choice
+
+    case "$choice" in
+        1) do_install ;;
+        2)
+            read -rp "  确认卸载? [y/N]: " confirm
+            [[ "$confirm" =~ ^[Yy]$ ]] && do_uninstall || echo "已取消"
+            ;;
+        3)
+            [[ -f "${INSTALL_DIR}/ports.env" ]] && print_node_info || echo "  未安装"
+            ;;
+        4)
+            log "INFO" "重启所有服务..."
+            for label in com.xray2go.xray com.xray2go.tunnel com.xray2go.sub; do
+                launchctl unload "${PLIST_DIR}/${label}.plist" 2>/dev/null || true
+                launchctl load -w "${PLIST_DIR}/${label}.plist" 2>/dev/null
+            done
+            log "INFO" "重启完成"
+            ;;
+        5) show_status ;;
+        6) setup_fixed_tunnel ;;
+        7) delete_fixed_tunnel ;;
+        8)
+            log "INFO" "切换回临时隧道..."
+            sed -i '' 's|^CF_TUNNEL_TOKEN=.*|CF_TUNNEL_TOKEN=|' "${INSTALL_DIR}/ports.env"
+            sed -i '' 's|^CF_TUNNEL_ID=.*|CF_TUNNEL_ID=|' "${INSTALL_DIR}/ports.env"
+            sed -i '' 's|^ARGO_DOMAIN=.*|ARGO_DOMAIN=|' "${INSTALL_DIR}/ports.env"
+            rm -f "${LOG_DIR}/argo.log" "${LOG_DIR}/argo-error.log"
+            generate_launch_agents
+            launchctl unload "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null || true
+            launchctl load -w "${PLIST_DIR}/com.xray2go.tunnel.plist" 2>/dev/null
+            log "INFO" "等待临时域名..."
+            sleep 10
+            local domain
+            domain=$(grep -h "trycloudflare" \
+                "${LOG_DIR}/argo.log" "${LOG_DIR}/argo-error.log" 2>/dev/null | \
+                grep -oE '[a-z0-9\-]+\.trycloudflare\.com' | tail -1)
+            [[ -n "$domain" ]] && {
+                sed -i '' "s|^ARGO_DOMAIN=.*|ARGO_DOMAIN=${domain}|" "${INSTALL_DIR}/ports.env"
+                log "INFO" "新域名: ${domain}"
+            }
+            ;;
+        9)
+            log "INFO" "更新 Xray..."
+            launchctl unload "${PLIST_DIR}/com.xray2go.xray.plist" 2>/dev/null || true
+            pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
+            sleep 1
+            download_xray
+            launchctl load -w "${PLIST_DIR}/com.xray2go.xray.plist" 2>/dev/null
+            log "INFO" "Xray 已更新"
+            ;;
+        0) exit 0 ;;
+        *) echo "  无效选择" ;;
+    esac
+
+    echo ""
+    read -rp "  按 Enter 返回菜单..." _
+    show_menu
+}
+
+# ============================================================
+# 入口
+# ============================================================
+main() {
+    case "${1:-menu}" in
+        install)   do_install ;;
+        uninstall) do_uninstall ;;
+        info)      [[ -f "${INSTALL_DIR}/ports.env" ]] && print_node_info || echo "未安装" ;;
+        status)    show_status ;;
+        restart)
+            for label in com.xray2go.xray com.xray2go.tunnel com.xray2go.sub; do
+                launchctl unload "${PLIST_DIR}/${label}.plist" 2>/dev/null || true
+                launchctl load -w "${PLIST_DIR}/${label}.plist" 2>/dev/null
+            done
+            ;;
+        menu|*)    show_menu ;;
+    esac
+}
+
+main "$@"
