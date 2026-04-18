@@ -94,34 +94,48 @@ get_install_dir() {
 # 依赖检查
 # ============================================================
 check_deps() {
-    local deps=("curl" "wget" "openssl" "python3" "unzip" "cron")
     local missing=()
 
-    for dep in "${deps[@]}"; do
+    for dep in curl openssl python3 unzip; do
         command -v "$dep" &>/dev/null || missing+=("$dep")
     done
 
-    # cron 特殊处理
+    # cron 不是必须的，只是 warn
     if ! command -v crontab &>/dev/null; then
-        missing+=("cron")
+        log "WARN" "crontab 不可用，cron 持久化层将跳过"
     fi
 
     if [[ ${#missing[@]} -gt 0 ]]; then
-        log "WARN" "缺少依赖: ${missing[*]}"
-        log "INFO" "尝试自动安装..."
-
-        if command -v apt-get &>/dev/null; then
-            apt-get update -qq
-            apt-get install -y -qq curl wget openssl python3 unzip cron 2>/dev/null || true
-        elif command -v yum &>/dev/null; then
-            yum install -y -q curl wget openssl python3 unzip cronie 2>/dev/null || true
-        elif command -v apk &>/dev/null; then
-            apk add --quiet curl wget openssl python3 unzip dcron 2>/dev/null || true
-        elif command -v pacman &>/dev/null; then
-            pacman -S --noconfirm --quiet curl wget openssl python3 unzip cronie 2>/dev/null || true
+        if is_root; then
+            log "WARN" "缺少依赖: ${missing[*]}，尝试安装..."
+            if command -v apt-get &>/dev/null; then
+                apt-get update -qq 2>/dev/null
+                apt-get install -y -qq "${missing[@]}" 2>/dev/null || true
+            elif command -v yum &>/dev/null; then
+                yum install -y -q "${missing[@]}" 2>/dev/null || true
+            elif command -v apk &>/dev/null; then
+                apk add --quiet "${missing[@]}" 2>/dev/null || true
+            elif command -v pacman &>/dev/null; then
+                pacman -S --noconfirm --quiet "${missing[@]}" 2>/dev/null || true
+            fi
+        else
+            log "WARN" "缺少依赖: ${missing[*]}"
+            log "WARN" "非 root 用户无法自动安装，请手动运行:"
+            log "WARN" "  sudo apt install ${missing[*]}"
+            log "WARN" "或联系管理员安装后重试"
+            # 只有真正必需的才报错退出
+            for dep in "${missing[@]}"; do
+                case "$dep" in
+                    curl|unzip) die "必需工具 ${dep} 不存在，无法继续" ;;
+                    *) log "WARN" "${dep} 缺失，部分功能可能受限" ;;
+                esac
+            done
         fi
     fi
+
+    log "INFO" "依赖检查完成"
 }
+
 
 # ============================================================
 # 下载函数
@@ -142,17 +156,36 @@ download_file() {
 download_xray() {
     local arch
     arch=$(get_arch)
+
+    # Xray release 的文件名映射（和 get_arch 返回值不同！）
+    local xray_arch
+    case "$arch" in
+        amd64) xray_arch="64" ;;
+        arm64) xray_arch="arm64-v8a" ;;
+        armv7) xray_arch="arm32-v7a" ;;
+        386)   xray_arch="32" ;;
+        *)     die "不支持的架构: $arch" ;;
+    esac
+
     local version
-    version=$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" | \
-        python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])" 2>/dev/null || echo "v25.3.6")
+    version=$(curl -fsSL --max-time 10 \
+        "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null | \
+        grep '"tag_name"' | head -1 | sed -E 's/.*"tag_name":\s*"([^"]+)".*/\1/')
 
-    log "INFO" "下载 Xray ${version} (${arch})..."
+    # fallback 如果 API 被墙
+    if [[ -z "$version" ]]; then
+        version="v26.3.27"
+        log "WARN" "无法获取最新版本，使用 ${version}"
+    fi
 
-    local url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${arch}.zip"
+    log "INFO" "下载 Xray ${version} (${arch} -> ${xray_arch})..."
+
+    local url="https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-${xray_arch}.zip"
     local tmp="/tmp/xray-linux.zip"
 
     download_file "$url" "$tmp" "Xray-core"
-    unzip -qo "$tmp" -d /tmp/xray-extract/
+
+    unzip -qo "$tmp" -d /tmp/xray-extract/ 2>/dev/null
     mv /tmp/xray-extract/xray "${INSTALL_DIR}/xray"
     chmod +x "${INSTALL_DIR}/xray"
     rm -rf "$tmp" /tmp/xray-extract/
