@@ -150,6 +150,12 @@ download_xray() {
     xattr -d com.apple.quarantine "${INSTALL_DIR}/xray" 2>/dev/null || true
     rm -rf "$tmp" "$extract_dir"
 
+    # 下载 GeoIP 和 GeoSite 数据文件
+    log "INFO" "下载 GeoIP/GeoSite 数据..."
+    curl -fsSL --retry 3 -o "${INSTALL_DIR}/geoip.dat"         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" ||         curl -fsSL -o "${INSTALL_DIR}/geoip.dat"         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat" || true
+
+    curl -fsSL --retry 3 -o "${INSTALL_DIR}/geosite.dat"         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" ||         curl -fsSL -o "${INSTALL_DIR}/geosite.dat"         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat" || true
+
     log "INFO" "Xray 已安装: ${INSTALL_DIR}/xray"
 }
 
