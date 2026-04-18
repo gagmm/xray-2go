@@ -994,15 +994,16 @@ SVCEOF
     fi
 fi
 
-# cron 自愈
-if ! crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
-    wlog "ALERT: cron 看门狗丢失，恢复..."
-    (crontab -l 2>/dev/null; echo "* * * * * \${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab -
+# cron 自愈（仅在 crontab 可用时）
+if command -v crontab &>/dev/null; then
+    if ! crontab -l 2>/dev/null | grep -q "watchdog.sh"; then
+        (crontab -l 2>/dev/null; echo "* * * * * \${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab - 2>/dev/null || true
+    fi
+    if ! crontab -l 2>/dev/null | grep -q "xray-boot.sh"; then
+        (crontab -l 2>/dev/null; echo "@reboot sleep 10 && \${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab - 2>/dev/null || true
+    fi
 fi
 
-if ! crontab -l 2>/dev/null | grep -q "xray-boot.sh"; then
-    (crontab -l 2>/dev/null; echo "@reboot sleep 10 && \${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab -
-fi
 WDEOF
     chmod +x "${INSTALL_DIR}/watchdog.sh"
 }
@@ -1054,15 +1055,27 @@ fi
 wlog "启动完毕"
 BOOTEOF
     chmod +x "${INSTALL_DIR}/xray-boot.sh"
+    # === crontab 相关（仅在 crontab 可用时配置）===
+    if command -v crontab &>/dev/null; then
+        local cron_now
+        cron_now=$(crontab -l 2>/dev/null || echo "")
 
-    # crontab
-    local cron_now
-    cron_now=$(crontab -l 2>/dev/null || echo "")
-    [[ "$cron_now" != *"xray-boot.sh"* ]] && \
-        (echo "$cron_now"; echo "@reboot sleep 10 && ${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1") | crontab -
-    [[ "$cron_now" != *"watchdog.sh"* ]] && \
-        cron_now=$(crontab -l 2>/dev/null || echo "") && \
-        (echo "$cron_now"; echo "* * * * * ${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1") | crontab -
+        local new_cron="$cron_now"
+        if [[ "$new_cron" != *"xray-boot.sh"* ]]; then
+            new_cron="${new_cron}"$'\n'"@reboot sleep 10 && ${INSTALL_DIR}/xray-boot.sh >/dev/null 2>&1"
+        fi
+        if [[ "$new_cron" != *"watchdog.sh"* ]]; then
+            new_cron="${new_cron}"$'\n'"* * * * * ${INSTALL_DIR}/watchdog.sh >/dev/null 2>&1"
+        fi
+        if [[ "$new_cron" != *"log-clean.sh"* ]]; then
+            new_cron="${new_cron}"$'\n'"0 */6 * * * ${INSTALL_DIR}/log-clean.sh >/dev/null 2>&1"
+        fi
+
+        echo "$new_cron" | grep -v '^[[:space:]]*$' | crontab - 2>/dev/null || true
+        log "INFO" "crontab 已配置"
+    else
+        log "WARN" "crontab 不可用，跳过 cron 持久化"
+    fi
 
     # rc.local
     if is_root; then
@@ -1476,6 +1489,22 @@ setup_immortal() {
     echo "  ✅ 多路径开机自启 (cron + rc.local + profile)"
     is_root && echo "  ✅ chattr +i 文件保护"
     echo ""
+        # 兜底：无 systemd 也无 cron 的容器环境，直接后台启动看门狗循环
+    if [[ $(detect_init_system) != "systemd" ]] && ! command -v crontab &>/dev/null; then
+        log "WARN" "无 systemd 和 cron，启动内置看门狗循环..."
+        cat > "${INSTALL_DIR}/watchdog-loop.sh" << 'LOOPEOF'
+#!/bin/bash
+INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
+while true; do
+    "${INSTALL_DIR}/watchdog.sh" 2>/dev/null
+    sleep 60
+done
+LOOPEOF
+        chmod +x "${INSTALL_DIR}/watchdog-loop.sh"
+        nohup "${INSTALL_DIR}/watchdog-loop.sh" >> "${INSTALL_DIR}/watchdog-loop.log" 2>&1 &
+        log "INFO" "内置看门狗循环已启动 (PID: $!)"
+    fi
+
 }
 
 # ============================================================
