@@ -145,6 +145,12 @@ download_file() {
     local dest="$2"
     local desc="${3:-文件}"
 
+    # 防止 Text file busy 报错，下载前先尝试停止进程并删除旧文件
+    if [[ "$dest" == *"/argo" ]] || [[ "$dest" == *"/xray" ]]; then
+        pkill -f "$dest" 2>/dev/null || true
+    fi
+    rm -f "$dest" 2>/dev/null || true
+
     log "INFO" "下载 ${desc}..."
     if command -v wget &>/dev/null; then
         wget -qO "$dest" "$url" || die "下载失败: $url"
