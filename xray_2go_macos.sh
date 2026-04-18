@@ -166,11 +166,17 @@ download_argo() {
     local url
 
     case "$arch" in
-        arm64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64" ;;
-        amd64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64" ;;
+        arm64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz" ;;
+        amd64) url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz" ;;
     esac
 
-    download_file "$url" "${INSTALL_DIR}/argo" "cloudflared for macOS"
+    local tmp_tgz="/tmp/cloudflared_mac.tgz"
+    download_file "$url" "$tmp_tgz" "cloudflared for macOS (.tgz)"
+    
+    tar -xzf "$tmp_tgz" -C "/tmp"
+    mv /tmp/cloudflared "${INSTALL_DIR}/argo"
+    rm -f "$tmp_tgz"
+    
     chmod +x "${INSTALL_DIR}/argo"
 
     # 移除隔离标志
