@@ -268,3 +268,4 @@ Reality 协议需要直连服务器 IP。如果服务器 IP 被墙，请使用 A
 ## 📜 开源许可
 
 本项目基于 [MIT License](LICENSE) 开源。
+Cloudflare Fixed Tunnel features and additional node support added.

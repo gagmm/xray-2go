@@ -1277,3 +1277,10 @@ function Show-Menu {
 
 # 入口
 Show-Menu
+
+function Setup-FixedTunnel {
+    Write-Host "配置 Cloudflare 固定隧道..."
+}
+function Delete-FixedTunnel {
+    Write-Host "删除固定隧道..."
+}

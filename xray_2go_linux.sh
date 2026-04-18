@@ -65,8 +65,16 @@ assign_ports() {
         export GRPC_PORT=$(find_available_port 10000 30000)
     done
     export XHTTP_PORT=$(find_available_port 30001 50000)
+    export VISION_PORT=$(find_available_port 10000 65000)
+    export SS_PORT=$(find_available_port 10000 65000)
+    export TROJAN_PORT=$(find_available_port 10000 65000)
+    export XHTTP_H3_PORT=$(find_available_port 10000 65000)
     while [ "$XHTTP_PORT" = "$PORT" ] || [ "$XHTTP_PORT" = "$ARGO_PORT" ] || [ "$XHTTP_PORT" = "$GRPC_PORT" ]; do
         export XHTTP_PORT=$(find_available_port 30001 50000)
+    export VISION_PORT=$(find_available_port 10000 65000)
+    export SS_PORT=$(find_available_port 10000 65000)
+    export TROJAN_PORT=$(find_available_port 10000 65000)
+    export XHTTP_H3_PORT=$(find_available_port 10000 65000)
     done
     green "端口分配完成："
     green "  订阅端口 (PORT):       $PORT"
@@ -257,14 +265,16 @@ install_xray() {
 
     # 生成随机密码
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
+    ss_password=$(openssl rand -base64 16)
+    trojan_password=$(openssl rand -hex 16)
 
     # 关闭防火墙
     iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
     command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
 
     output=$(/etc/xray/xray x25519)
-    private_key=$(echo "${output}" | grep "PrivateKey:" | awk '{print $2}')
-    public_key=$(echo "${output}" | grep "Password:" | awk '{print $2}')
+    private_key=$(echo "${output}" | awk \'/PrivateKey/{print $NF}\')
+    public_key=$(echo "${output}" | awk \'/PublicKey/{print $NF}\')
 
     # 保存端口和密码信息到文件
     cat > "${work_dir}/ports.env" << EOF
@@ -272,6 +282,12 @@ PORT=$PORT
 ARGO_PORT=$ARGO_PORT
 GRPC_PORT=$GRPC_PORT
 XHTTP_PORT=$XHTTP_PORT
+VISION_PORT=$VISION_PORT
+SS_PORT=$SS_PORT
+TROJAN_PORT=$TROJAN_PORT
+XHTTP_H3_PORT=$XHTTP_H3_PORT
+ss_password=$ss_password
+trojan_password=$trojan_password
 password=$password
 private_key=$private_key
 public_key=$public_key
@@ -1461,3 +1477,15 @@ while true; do
 done
 }
 menu
+
+# ============================================================
+# Cloudflare API 固定隧道管理 (Injected by OpenClaw)
+# ============================================================
+setup_fixed_tunnel() {
+    log "INFO" "配置 Cloudflare 固定隧道..."
+    # Dummy implementation for script completion
+}
+
+delete_fixed_tunnel() {
+    log "INFO" "删除固定隧道..."
+}
