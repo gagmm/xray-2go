@@ -196,6 +196,12 @@ download_xray() {
     chmod +x "${INSTALL_DIR}/xray"
     rm -rf "$tmp" /tmp/xray-extract/
 
+    # 下载 GeoIP 和 GeoSite 数据文件
+    log "INFO" "下载 GeoIP/GeoSite 数据..."
+    curl -fsSL --retry 3 -o "${INSTALL_DIR}/geoip.dat"         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" ||         curl -fsSL -o "${INSTALL_DIR}/geoip.dat"         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat" || true
+
+    curl -fsSL --retry 3 -o "${INSTALL_DIR}/geosite.dat"         "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" ||         curl -fsSL -o "${INSTALL_DIR}/geosite.dat"         "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat" || true
+
     log "INFO" "Xray 已安装: ${INSTALL_DIR}/xray"
 }
 
@@ -1684,8 +1690,8 @@ show_menu() {
                 is_root && systemctl status xray tunnel --no-pager || \
                     systemctl --user status xray tunnel --no-pager
             else
-                pgrep -f "${INSTALL_DIR}/xray" && echo "Xray: 运行中" || echo "Xray: 未运行"
-                pgrep -f "${INSTALL_DIR}/argo" && echo "Tunnel: 运行中" || echo "Tunnel: 未运行"
+                pgrep -f "${INSTALL_DIR}/xray" >/dev/null 2>&1 && echo "Xray: 运行中" || echo "Xray: 未运行"
+                pgrep -f "${INSTALL_DIR}/argo" >/dev/null 2>&1 && echo "Tunnel: 运行中" || echo "Tunnel: 未运行"
             fi
             ;;
         6) setup_fixed_tunnel ;;
