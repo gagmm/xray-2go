@@ -8,6 +8,12 @@
 
 set -euo pipefail
 
+# 修复非 root 用户 systemd --user 环境变量
+if [[ $(id -u) -ne 0 ]]; then
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
+fi
+
 # ============================================================
 # 全局变量
 # ============================================================
@@ -811,6 +817,14 @@ OnUnitActiveSec=60
 [Install]
 WantedBy=timers.target
 EOF
+
+        # 检查 user systemd 是否可用
+        if [[ ! -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" ]]; then
+            log "WARN" "systemd --user 不可用 (XDG_RUNTIME_DIR 不存在)"
+            log "WARN" "请让管理员执行: sudo loginctl enable-linger $(whoami)"
+            log "INFO" "回退到 cron + 直接进程模式"
+            return 0
+        fi
 
         systemctl --user daemon-reload
         systemctl --user enable --now xray tunnel xray-sub xray-watchdog.timer 2>/dev/null
