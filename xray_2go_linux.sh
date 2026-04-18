@@ -1526,6 +1526,14 @@ do_install() {
     log "STEP" "==== Xray-2go Linux 安装开始 ===="
     log "INFO" "安装目录: ${INSTALL_DIR}"
 
+    # 在执行下载和覆盖前，必须先解除全部保护并停止相关进程，否则会报 Text file busy 或 Permission denied
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        unprotect_files
+        pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
+        pkill -f "${INSTALL_DIR}/argo" 2>/dev/null || true
+        rm -f "${INSTALL_DIR}/xray" "${INSTALL_DIR}/argo" 2>/dev/null || true
+    fi
+
     check_deps
     generate_ports
     download_xray
