@@ -110,6 +110,12 @@ download_file() {
     local dest="$2"
     local desc="${3:-文件}"
 
+    # 防止 Text file busy 报错，下载前先尝试停止进程并删除旧文件
+    if [[ "$dest" == *"/argo" ]] || [[ "$dest" == *"/xray" ]]; then
+        pkill -f "$dest" 2>/dev/null || true
+    fi
+    rm -f "$dest" 2>/dev/null || true
+
     log "INFO" "下载 ${desc}..."
     curl -fsSL --retry 3 --retry-delay 2 -o "$dest" "$url" || die "下载失败: $url"
 }
@@ -1389,6 +1395,15 @@ do_install() {
     log "STEP" "==== Xray-2go macOS 安装开始 ===="
     log "INFO" "安装目录: ${INSTALL_DIR}"
     log "INFO" "macOS $(get_macos_version) $(get_arch)"
+
+    # 在执行下载和覆盖前，强制停止相关进程并删除旧文件
+    if [[ -d "${INSTALL_DIR}" ]]; then
+        # 卸载服务，防止看门狗立即重启进程
+        unload_launch_agents 2>/dev/null || true
+        pkill -f "${INSTALL_DIR}/xray" 2>/dev/null || true
+        pkill -f "${INSTALL_DIR}/argo" 2>/dev/null || true
+        rm -f "${INSTALL_DIR}/xray" "${INSTALL_DIR}/argo" 2>/dev/null || true
+    fi
 
     check_macos_version
     check_deps

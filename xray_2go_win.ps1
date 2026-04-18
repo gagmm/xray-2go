@@ -1330,6 +1330,16 @@ function Do-Install {
     Write-Info "Windows $(Get-WinVersion) | 架构: $(Get-Arch)"
     Write-Info "管理员: $(Test-IsAdmin)"
 
+    # 安装前强制停止相关进程并清理旧文件
+    if (Test-Path $INSTALL_DIR) {
+        Unregister-ScheduledTask -TaskName "Xray2goBoot" -Confirm:$false -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName "Xray2goWatchdog" -Confirm:$false -ErrorAction SilentlyContinue
+        Get-Process -Name "xray" -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*$INSTALL_DIR*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Where-Object { $_.Path -like "*$INSTALL_DIR*" } | Stop-Process -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $INSTALL_DIR "xray.exe") -Force -ErrorAction SilentlyContinue
+        Remove-Item (Join-Path $INSTALL_DIR "cloudflared.exe") -Force -ErrorAction SilentlyContinue
+    }
+
     # 创建目录
     New-Item -ItemType Directory -Force -Path $INSTALL_DIR | Out-Null
     New-Item -ItemType Directory -Force -Path $LOG_DIR     | Out-Null
