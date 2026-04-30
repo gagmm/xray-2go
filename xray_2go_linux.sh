@@ -267,7 +267,7 @@ install_xray() {
 
     output=$(/etc/xray/xray x25519)
     private_key=$(echo "${output}" | grep "PrivateKey:" | awk '{print $2}')
-    public_key=$(echo "${output}" | grep "Password:" | awk '{print $2}')
+    public_key=$(echo "${output}" | grep 'Password (PublicKey):' | awk '{print $3}')
 
     # 保存端口和密码信息到文件
     cat > "${work_dir}/ports.env" << EOF
@@ -323,7 +323,7 @@ cat > "${config_dir}" << EOF
     },
     {
       "listen":"::","port":$GRPC_PORT,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
-      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.joom.com:443","serverNames":["www.joom.com"],
+      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.iij.ad.jp:443","serverNames":["www.iij.ad.jp"],
       "privateKey":"$private_key","shortIds":[""]},"grpcSettings":{"serviceName":"grpc"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
   ],
@@ -469,7 +469,7 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.joom.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.joom.com&serviceName=grpc&mode=gun#${isp}
+vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
 
 vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
 
@@ -1111,7 +1111,7 @@ case "${choice}" in
             elif [[ "$new_sni" == "1" ]]; then
                 new_sni="bgk.jp"
             elif [[ "$new_sni" == "2" ]]; then
-                new_sni="www.joom.com"
+                new_sni="www.iij.ad.jp"
             elif [[ "$new_sni" == "3" ]]; then
                 new_sni="www.stengg.com"
             elif [[ "$new_sni" == "4" ]]; then
