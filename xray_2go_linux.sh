@@ -55,24 +55,38 @@ find_available_port() {
 # 自动分配所有端口
 assign_ports() {
     yellow "正在自动分配可用端口..."
-    export PORT=$(find_available_port 1000 60000)
-    export ARGO_PORT=$(find_available_port 8000 9000)
-    while [ "$ARGO_PORT" = "$PORT" ]; do
-        export ARGO_PORT=$(find_available_port 8000 9000)
-    done
-    export GRPC_PORT=$(find_available_port 10000 30000)
-    while [ "$GRPC_PORT" = "$PORT" ] || [ "$GRPC_PORT" = "$ARGO_PORT" ]; do
-        export GRPC_PORT=$(find_available_port 10000 30000)
-    done
-    export XHTTP_PORT=$(find_available_port 30001 50000)
-    while [ "$XHTTP_PORT" = "$PORT" ] || [ "$XHTTP_PORT" = "$ARGO_PORT" ] || [ "$XHTTP_PORT" = "$GRPC_PORT" ]; do
-        export XHTTP_PORT=$(find_available_port 30001 50000)
-    done
+    local assigned=()
+    _alloc_port() {
+        local lo=$1 hi=$2 name=$3
+        local p
+        while :; do
+            p=$(find_available_port "$lo" "$hi")
+            local clash=0
+            for x in "${assigned[@]}"; do
+                if [ "$x" = "$p" ]; then clash=1; break; fi
+            done
+            [ $clash -eq 0 ] && break
+        done
+        assigned+=("$p")
+        export $name=$p
+    }
+    _alloc_port 1000  60000 PORT
+    _alloc_port 8000  9000  ARGO_PORT
+    _alloc_port 10000 15000 GRPC_PORT
+    _alloc_port 15001 20000 XHTTP_PORT
+    _alloc_port 20001 25000 VISION_PORT       # 新增：vless+vision+reality (tcp)
+    _alloc_port 25001 30000 WSREALITY_PORT    # 新增：vless+ws+reality
+    _alloc_port 30001 35000 SS_PORT           # 新增：shadowsocks 2022
+    _alloc_port 35001 40000 HY2_PORT          # 新增：hysteria2 (udp)
     green "端口分配完成："
-    green "  订阅端口 (PORT):       $PORT"
-    green "  Argo 端口 (ARGO_PORT): $ARGO_PORT"
-    green "  GRPC 端口:             $GRPC_PORT"
-    green "  XHTTP 端口:            $XHTTP_PORT"
+    green "  订阅端口 (PORT):            $PORT"
+    green "  Argo 端口 (ARGO_PORT):      $ARGO_PORT"
+    green "  GRPC-Reality 端口:         $GRPC_PORT"
+    green "  XHTTP-Reality 端口:        $XHTTP_PORT"
+    green "  Vision-Reality 端口:       $VISION_PORT"
+    green "  WS-Reality 端口:           $WSREALITY_PORT"
+    green "  Shadowsocks-2022 端口:     $SS_PORT"
+    green "  Hysteria2 端口 (UDP):      $HY2_PORT"
 }
 
 # 加载保存的端口配置
@@ -260,6 +274,8 @@ install_xray() {
 
     # 生成随机密码
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
+    # Shadowsocks 2022 (blake3-aes-128-gcm) 需要 16 字节 base64 密钥
+    ss_key=$(openssl rand -base64 16 2>/dev/null || head -c 16 /dev/urandom | base64)
 
     # 关闭防火墙
     iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
@@ -275,7 +291,12 @@ PORT=$PORT
 ARGO_PORT=$ARGO_PORT
 GRPC_PORT=$GRPC_PORT
 XHTTP_PORT=$XHTTP_PORT
+VISION_PORT=$VISION_PORT
+WSREALITY_PORT=$WSREALITY_PORT
+SS_PORT=$SS_PORT
+HY2_PORT=$HY2_PORT
 password=$password
+ss_key=$ss_key
 private_key=$private_key
 public_key=$public_key
 UUID=$UUID
@@ -288,6 +309,7 @@ cat > "${config_dir}" << EOF
   "inbounds": [
     {
       "port": $ARGO_PORT,
+      "tag": "in-argo-vision",
       "protocol": "vless",
       "settings": {
         "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
@@ -300,31 +322,51 @@ cat > "${config_dir}" << EOF
       "streamSettings": { "network": "tcp" }
     },
     {
-      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
+      "port": 3001, "listen": "127.0.0.1", "tag": "in-argo-fb-tcp", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
       "streamSettings": { "network": "tcp", "security": "none" }
     },
     {
-      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
+      "port": 3002, "listen": "127.0.0.1", "tag": "in-argo-vless-ws", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID", "level": 0 }], "decryption": "none" },
       "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
     },
     {
-      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
+      "port": 3003, "listen": "127.0.0.1", "tag": "in-argo-vmess-ws", "protocol": "vmess",
       "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
     },
     {
-      "listen":"::","port": $XHTTP_PORT, "protocol": "vless","settings": {"clients": [{"id": "$UUID"}],"decryption": "none"},
+      "listen":"::","port": $XHTTP_PORT, "tag": "in-xhttp-reality", "protocol": "vless","settings": {"clients": [{"id": "$UUID"}],"decryption": "none"},
       "streamSettings": {"network": "xhttp","security": "reality","realitySettings": {"target": "www.nazhumi.com:443","xver": 0,"serverNames":
       ["www.nazhumi.com"],"privateKey": "$private_key","shortIds": [""]}},"sniffing": {"enabled": true,"destOverride": ["http","tls","quic"]}
     },
     {
-      "listen":"::","port":$GRPC_PORT,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+      "listen":"::","port":$GRPC_PORT,"tag":"in-grpc-reality","protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
       "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.iij.ad.jp:443","serverNames":["www.iij.ad.jp"],
       "privateKey":"$private_key","shortIds":[""]},"grpcSettings":{"serviceName":"grpc"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$VISION_PORT,"tag":"in-vision-reality","protocol":"vless",
+      "settings":{"clients":[{"id":"$UUID","flow":"xtls-rprx-vision"}],"decryption":"none"},
+      "streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"www.nazhumi.com:443","xver":0,"serverNames":["www.nazhumi.com"],
+      "privateKey":"$private_key","shortIds":[""]}},
+      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$WSREALITY_PORT,"tag":"in-ws-reality","protocol":"vless",
+      "settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
+      "streamSettings":{"network":"ws","security":"reality","realitySettings":{"dest":"www.nazhumi.com:443","xver":0,"serverNames":["www.nazhumi.com"],
+      "privateKey":"$private_key","shortIds":[""]},"wsSettings":{"path":"/ws"}},
+      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$SS_PORT,"tag":"in-ss2022","protocol":"shadowsocks",
+      "settings":{"method":"2022-blake3-aes-128-gcm","password":"$ss_key","network":"tcp,udp"},
+      "streamSettings":{"network":"tcp"},
+      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
   ],
   "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
@@ -469,13 +511,19 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
+vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}-grpc-reality
 
-vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
+vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality
 
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}
+vless://${UUID}@${IP}:${VISION_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=tcp#${isp}-vision-reality
 
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)
+vless://${UUID}@${IP}:${WSREALITY_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=ws&path=%2Fws&host=www.nazhumi.com#${isp}-ws-reality
+
+ss://$(echo -n "2022-blake3-aes-128-gcm:${ss_key}" | base64 -w0)@${IP}:${SS_PORT}#${isp}-ss2022
+
+vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo
+
+vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}-vmess-argo\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64 -w0)
 
 EOF
     echo ""
