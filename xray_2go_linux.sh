@@ -356,13 +356,6 @@ cat > "${config_dir}" << EOF
       "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     },
     {
-      "listen":"::","port":$WSREALITY_PORT,"tag":"in-ws-reality","protocol":"vless",
-      "settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
-      "streamSettings":{"network":"ws","security":"reality","realitySettings":{"dest":"www.nazhumi.com:443","xver":0,"serverNames":["www.nazhumi.com"],
-      "privateKey":"$private_key","shortIds":[""]},"wsSettings":{"path":"/ws"}},
-      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
-    },
-    {
       "listen":"::","port":$SS_PORT,"tag":"in-ss2022","protocol":"shadowsocks",
       "settings":{"method":"2022-blake3-aes-128-gcm","password":"$ss_key","network":"tcp,udp"},
       "streamSettings":{"network":"tcp"},
@@ -516,8 +509,6 @@ vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij
 vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality
 
 vless://${UUID}@${IP}:${VISION_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=tcp#${isp}-vision-reality
-
-vless://${UUID}@${IP}:${WSREALITY_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=ws&path=%2Fws&host=www.nazhumi.com#${isp}-ws-reality
 
 ss://$(echo -n "2022-blake3-aes-128-gcm:${ss_key}" | base64 -w0)@${IP}:${SS_PORT}#${isp}-ss2022
 
