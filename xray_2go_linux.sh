@@ -249,7 +249,10 @@ install_xray() {
 
     # 下载xray,cloudflared
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
-    curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH_ARG}.zip"
+    # 使用 gagmm/Xray-core fork（包含 pgstats 观测插件）。要回退到上游，请把下一行改成 XTLS/Xray-core/releases/latest。
+    XRAY_RELEASE_REPO="${XRAY_RELEASE_REPO:-gagmm/Xray-core}"
+    XRAY_RELEASE_TAG="${XRAY_RELEASE_TAG:-v26.4.25-pgstats1}"
+    curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/${XRAY_RELEASE_REPO}/releases/download/${XRAY_RELEASE_TAG}/Xray-linux-${ARCH_ARG}.zip"
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
     curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
     unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
@@ -328,7 +331,21 @@ cat > "${config_dir}" << EOF
   "outbounds": [
     { "protocol": "freedom", "tag": "direct" },
     { "protocol": "blackhole", "tag": "block" }
-  ]
+  ]$( [ -n "$PGSTATS_DSN" ] && cat <<PGSECTION
+,
+  "pgstats": {
+    "enabled": true,
+    "dsn": "${PGSTATS_DSN//\"/\\\"}",
+    "snapshotIntervalSeconds": ${PGSTATS_SNAPSHOT_INTERVAL:-10},
+    "maxHttpCaptureBytes": ${PGSTATS_MAX_HTTP_BYTES:-102400},
+    "captureHttp": ${PGSTATS_CAPTURE_HTTP:-true},
+    "captureConnections": ${PGSTATS_CAPTURE_CONN:-true},
+    "captureIpStats": ${PGSTATS_CAPTURE_IP:-true},
+    "captureOnline": ${PGSTATS_CAPTURE_ONLINE:-true},
+    "queueBuffer": ${PGSTATS_QUEUE:-4096}
+  }
+PGSECTION
+)
 }
 EOF
 }
@@ -363,7 +380,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/etc/xray/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol http2
+ExecStart=/etc/xray/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol auto
 StandardOutput=append:/etc/xray/argo.log
 Restart=on-failure
 RestartSec=5s
@@ -407,7 +424,7 @@ EOF
 
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/xray/argo.log 2>&1'"
+command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol auto > /etc/xray/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/tunnel.pid"
 EOF
@@ -1240,7 +1257,7 @@ else
                 cat > ${work_dir}/tunnel.yml << EOF
 tunnel: $(cut -d\" -f12 <<< "$argo_auth")
 credentials-file: ${work_dir}/tunnel.json
-protocol: http2
+protocol: auto
 
 ingress:
   - hostname: $ArgoDomain
@@ -1258,9 +1275,9 @@ EOF
                 change_argo_domain
             elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
                 if [ -f /etc/alpine-release ]; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
+                    sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol auto run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
+                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol auto run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
                 fi
                 restart_argo
                 change_argo_domain
