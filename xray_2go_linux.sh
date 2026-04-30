@@ -323,7 +323,7 @@ cat > "${config_dir}" << EOF
     },
     {
       "listen":"::","port":$GRPC_PORT,"protocol":"vless","settings":{"clients":[{"id":"$UUID"}],"decryption":"none"},
-      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.iij.ad.jp:443","serverNames":["www.iij.ad.jp"],
+      "streamSettings":{"network":"grpc","security":"reality","realitySettings":{"dest":"www.joom.com:443","serverNames":["www.joom.com"],
       "privateKey":"$private_key","shortIds":[""]},"grpcSettings":{"serviceName":"grpc"}},"sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
   ],
@@ -380,7 +380,7 @@ After=network.target
 Type=simple
 NoNewPrivileges=yes
 TimeoutStartSec=0
-ExecStart=/etc/xray/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol auto
+ExecStart=/etc/xray/argo tunnel --url http://localhost:$ARGO_PORT --no-autoupdate --edge-ip-version auto --protocol http2
 StandardOutput=append:/etc/xray/argo.log
 Restart=on-failure
 RestartSec=5s
@@ -424,7 +424,7 @@ EOF
 
 description="Cloudflare Tunnel"
 command="/bin/sh"
-command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol auto > /etc/xray/argo.log 2>&1'"
+command_args="-c '/etc/xray/argo tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2 > /etc/xray/argo.log 2>&1'"
 command_background=true
 pidfile="/var/run/tunnel.pid"
 EOF
@@ -469,7 +469,7 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
+vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.joom.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.joom.com&serviceName=grpc&mode=gun#${isp}
 
 vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
 
@@ -1257,7 +1257,7 @@ else
                 cat > ${work_dir}/tunnel.yml << EOF
 tunnel: $(cut -d\" -f12 <<< "$argo_auth")
 credentials-file: ${work_dir}/tunnel.json
-protocol: auto
+protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
@@ -1275,9 +1275,9 @@ EOF
                 change_argo_domain
             elif [[ $argo_auth =~ ^[A-Z0-9a-z=]{120,250}$ ]]; then
                 if [ -f /etc/alpine-release ]; then
-                    sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol auto run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
+                    sed -i "/^command_args=/c\command_args=\"-c '/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token $argo_auth 2>&1'\"" /etc/init.d/tunnel
                 else
-                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol auto run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
+                    sed -i '/^ExecStart=/c ExecStart=/bin/sh -c "/etc/xray/argo tunnel --edge-ip-version auto --no-autoupdate --protocol http2 run --token '$argo_auth' 2>&1"' /etc/systemd/system/tunnel.service
                 fi
                 restart_argo
                 change_argo_domain
