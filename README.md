@@ -126,6 +126,11 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 | `PGSTATS_DSN` | 兼容 pgstats 的 PostgreSQL DSN | 空 |
 | `XRAY2GO_PG_PEER_USER` | 本机 PostgreSQL peer 鉴权用户，如 `postgres` | 空 |
 | `XRAY2GO_LINKS_FILE` | 指定要上传的 links 文件路径 | 自动查找 `xray2go_links_latest.txt` |
+| `REALITY_GRPC_SNI` / `REALITY_GRPC_TARGET` | 手动指定 GRPC Reality 的 SNI / 回落目标 | `www.iij.ad.jp` |
+| `REALITY_XHTTP_SNI` / `REALITY_XHTTP_TARGET` | 手动指定 XHTTP/Vision Reality 的 SNI / 回落目标 | `www.nazhumi.com` |
+| `REALITY_SCAN` | Linux: 设为 `1` 后启用 RealiTLScanner 自动扫描 REALITY 伪装目标 | `0` |
+| `REALITY_SCAN_ADDR` / `REALITY_SCAN_URL` / `REALITY_SCAN_IN` | Linux: RealiTLScanner 的扫描目标（IP/CIDR/域名、抓取 URL、目标列表文件三选一） | 空 |
+| `REALITY_SCAN_PORT` / `REALITY_SCAN_THREAD` / `REALITY_SCAN_TIMEOUT` / `REALITY_SCAN_MAX_SECONDS` | Linux: RealiTLScanner 端口、线程、单目标超时、整体超时 | `443` / `5` / `5` / `180` |
 
 > 💡 **NAT 小鸡**需带 `PORT` 变量运行，并确保 PORT 之后的 2 个端口可用（GRPC/XHTTP），或安装后通过菜单更改端口。
 
@@ -134,6 +139,8 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 安装/导出节点后，若检测到 PostgreSQL 环境变量，脚本会自动把 `xray2go_links_latest.txt` 写入 `public.xray_node_configs.links`。上传失败不会中断安装。
 
 Linux 默认下载 `gagmm/Xray-core` 的 pgstats 版核心；设置 `PGSTATS_DSN` 后会启用 `xray_http_captures`，新版核心会记录明文 HTTP 的 method/host/path/header 以及请求 body 预览字段：`body`、`body_size`、`body_truncated`、`body_base64`。同一 keep-alive 连接里的多个 HTTP/1.x 请求也会记录；HTTPS 内容不会被解密。
+
+Linux 可选启用 RealiTLScanner 自动扫描 REALITY 伪装目标。扫描成功后会把扫描到的 `IP:443` 用作 REALITY 回落目标，把可用域名用作 SNI；扫描失败、超时或未启用时，会自动回退到内置域名 `www.iij.ad.jp` / `www.nazhumi.com`。RealiTLScanner 官方说明建议优先在本地运行，云服务器上大范围扫描可能让 VPS 被标记，因此脚本默认不自动扫描。
 
 Linux 手动上传：
 
