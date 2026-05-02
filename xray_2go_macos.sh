@@ -594,6 +594,7 @@ EOF
 
     # 安装完成后自动导出一份到桌面
     export_proxy_txt "auto"
+    xray2go_upload_links_latest_to_postgres || true
 }
 
 # caddy 订阅配置
@@ -758,6 +759,101 @@ EXPORTEOF
     green "  详细版(latest): ${export_file_latest}"
     green "  纯链接: ${links_file}"
     green "  纯链接(latest): ${links_file_latest}\n"
+}
+
+# ==========================================
+# PostgreSQL 上传 xray2go_links_latest.txt (xray2go+)
+# ==========================================
+xray2go_postgres_enabled() {
+    [[ -n "${DATABASE_URL:-}" || -n "${POSTGRES_HOST:-}" || -n "${POSTGRES_USER:-}" || -n "${POSTGRES_DB:-}" || -n "${PGHOST:-}" || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" || -n "${PGSTATS_DSN:-}" ]]
+}
+
+xray2go_psql_exec() {
+    local sql_file="$1"
+    if ! command -v psql &>/dev/null; then
+        yellow "psql 不可用，跳过 PostgreSQL 上传"
+        return 1
+    fi
+    if [[ -n "${DATABASE_URL:-}" ]]; then
+        PGPASSWORD="${POSTGRES_PASSWORD:-${PGPASSWORD:-}}" psql "${DATABASE_URL}" -v ON_ERROR_STOP=1 -q -f "$sql_file"
+    elif [[ -n "${PGSTATS_DSN:-}" ]]; then
+        psql "${PGSTATS_DSN}" -v ON_ERROR_STOP=1 -q -f "$sql_file"
+    else
+        PGHOST="${POSTGRES_HOST:-${PGHOST:-127.0.0.1}}" \
+        PGPORT="${POSTGRES_PORT:-${PGPORT:-5432}}" \
+        PGUSER="${POSTGRES_USER:-${PGUSER:-postgres}}" \
+        PGPASSWORD="${POSTGRES_PASSWORD:-${PGPASSWORD:-}}" \
+        PGDATABASE="${POSTGRES_DB:-${PGDATABASE:-xray}}" \
+            psql -v ON_ERROR_STOP=1 -q -f "$sql_file"
+    fi
+}
+
+xray2go_upload_links_latest_to_postgres() {
+    xray2go_postgres_enabled || return 0
+
+    local links_file="${XRAY2GO_LINKS_FILE:-}"
+    if [[ -z "$links_file" ]]; then
+        for candidate in "${export_dir}/xray2go_links_latest.txt" "$(pwd)/xray2go_links_latest.txt" "${HOME}/xray2go_links_latest.txt" "${work_dir}/xray2go_links_latest.txt" "${work_dir}/url.txt"; do
+            [[ -f "$candidate" ]] && { links_file="$candidate"; break; }
+        done
+    fi
+    [[ -f "$links_file" ]] || { yellow "未找到 xray2go_links_latest.txt，跳过 PostgreSQL 上传"; return 0; }
+
+    local IP argodomain tmp_sql
+    IP=$(get_realip)
+    argodomain=""
+    [[ -f "${work_dir}/argo.log" ]] && argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
+    tmp_sql=$(mktemp)
+
+    XRAY2GO_WORK_DIR="${work_dir}" XRAY2GO_CONFIG_DIR="${config_dir}" XRAY2GO_LINKS_FILE="$links_file" XRAY2GO_PUBLIC_IP="$IP" XRAY2GO_ARGO_DOMAIN="$argodomain" XRAY2GO_CFIP="$CFIP" python3 - <<'PYEOF' > "$tmp_sql"
+import hashlib, json, os, socket
+from pathlib import Path
+work_dir = Path(os.environ["XRAY2GO_WORK_DIR"])
+ports_env = work_dir / "ports.env"
+config_file = Path(os.environ.get("XRAY2GO_CONFIG_DIR", str(work_dir / "config.json")))
+links_file = Path(os.environ["XRAY2GO_LINKS_FILE"])
+def read_env(path):
+    data = {}
+    if path.exists():
+        for line in path.read_text(errors="ignore").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1); data[k.strip()] = v.strip()
+    return data
+def q(v): return "NULL" if v is None else "'" + str(v).replace("'", "''") + "'"
+def qjson(v): return q(json.dumps(v, ensure_ascii=False, sort_keys=True)) + "::jsonb"
+p = read_env(ports_env)
+links, meta = {}, {"source_file": str(links_file), "platform": "macos"}
+for i, line in enumerate([x.strip() for x in links_file.read_text(errors="ignore").splitlines() if x.strip() and not x.strip().startswith("#")], 1):
+    if "=" in line and not line.startswith(("vless://", "vmess://", "ss://", "trojan://", "hysteria2://")):
+        k, v = line.split("=", 1); k, v = k.strip(), v.strip()
+        (links if "://" in v else meta)[k or f"link_{i}"] = v
+    else:
+        links[f"link_{i}"] = line
+hostname = socket.gethostname()
+public_ip = os.environ.get("XRAY2GO_PUBLIC_IP", "").strip().strip("[]")
+public_ip_sql = "NULL" if not public_ip or public_ip == "127.0.0.1" else q(public_ip) + "::inet"
+ports = {k: int(v) for k, v in p.items() if k.endswith("PORT") and str(v).isdigit()}
+sub_url = f"http://{public_ip}:{p.get('PORT','')}/{p.get('password','')}" if public_ip and p.get("PORT") and p.get("password") else ""
+try: config_json = json.loads(config_file.read_text()) if config_file.exists() else {}
+except Exception: config_json = {"_raw": config_file.read_text(errors="ignore")[:200000]} if config_file.exists() else {}
+node_id = os.environ.get("XRAY2GO_NODE_ID") or hashlib.sha256(f"{hostname}|{work_dir}".encode()).hexdigest()[:24]
+print("""
+CREATE TABLE IF NOT EXISTS public.xray_node_configs (
+ node_id text PRIMARY KEY, hostname text NOT NULL DEFAULT '', public_ip inet, install_dir text NOT NULL DEFAULT '', cdn_host text NOT NULL DEFAULT '', argo_domain text NOT NULL DEFAULT '', sub_url text NOT NULL DEFAULT '', uuid text NOT NULL DEFAULT '', public_key text NOT NULL DEFAULT '', ports jsonb NOT NULL DEFAULT '{}'::jsonb, links jsonb NOT NULL DEFAULT '{}'::jsonb, config_json jsonb NOT NULL DEFAULT '{}'::jsonb, raw_ports_env jsonb NOT NULL DEFAULT '{}'::jsonb, script_version text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+""")
+print(f"""
+INSERT INTO public.xray_node_configs (node_id, hostname, public_ip, install_dir, cdn_host, argo_domain, sub_url, uuid, public_key, ports, links, config_json, raw_ports_env, script_version, created_at, updated_at)
+VALUES ({q(node_id)}, {q(hostname)}, {public_ip_sql}, {q(str(work_dir))}, {q(meta.get('host') or os.environ.get('XRAY2GO_CFIP',''))}, {q(os.environ.get('XRAY2GO_ARGO_DOMAIN',''))}, {q(sub_url)}, {q(p.get('UUID',''))}, {q(p.get('public_key',''))}, {qjson(ports)}, {qjson(links)}, {qjson(config_json)}, {qjson({**p, **meta})}, 'links_latest_macos', now(), now())
+ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname, public_ip=EXCLUDED.public_ip, install_dir=EXCLUDED.install_dir, cdn_host=EXCLUDED.cdn_host, argo_domain=EXCLUDED.argo_domain, sub_url=EXCLUDED.sub_url, uuid=EXCLUDED.uuid, public_key=EXCLUDED.public_key, ports=EXCLUDED.ports, links=EXCLUDED.links, config_json=EXCLUDED.config_json, raw_ports_env=EXCLUDED.raw_ports_env, script_version=EXCLUDED.script_version, updated_at=now();
+""")
+PYEOF
+    if xray2go_psql_exec "$tmp_sql"; then
+        green "xray2go_links_latest.txt 已上传到 PostgreSQL 表 public.xray_node_configs"
+    else
+        yellow "PostgreSQL 上传失败，安装流程继续"
+    fi
+    rm -f "$tmp_sql"
 }
 
 # 导出菜单
@@ -1441,6 +1537,23 @@ check_nodes() {
 # 捕获 Ctrl+C 信号
 trap 'red "已取消操作"; exit' INT
 
+install_xray2go_all() {
+    check_xray &>/dev/null; local check_xray_ret=$?
+    if [ $check_xray_ret -eq 0 ]; then
+        yellow "Xray-2go 已经安装！"
+        xray2go_upload_links_latest_to_postgres || true
+        return 0
+    fi
+    install_caddy
+    manage_packages install jq qrencode
+    install_xray
+    macos_launchd_services
+    sleep 3
+    get_info
+    add_caddy_conf
+    create_shortcut
+}
+
 # 主菜单
 menu() {
     while true; do
@@ -1467,26 +1580,14 @@ menu() {
         green "7. 管理节点订阅"
         echo "==============="
         skyblue "8. 导出代理为txt"
+        skyblue "9. 上传 xray2go_links_latest.txt 到 PostgreSQL"
         echo "==============="
         red "0. 退出脚本"
         echo "==========="
-        reading "请输入选择(0-8): " choice
+        reading "请输入选择(0-9): " choice
         echo ""
         case "${choice}" in
-            1)
-                if [ $check_xray_ret -eq 0 ]; then
-                    yellow "Xray-2go 已经安装！"
-                else
-                    install_caddy
-                    manage_packages install jq qrencode
-                    install_xray
-                    macos_launchd_services
-                    sleep 3
-                    get_info
-                    add_caddy_conf
-                    create_shortcut
-                fi
-                ;;
+            1) install_xray2go_all ;;
             2) uninstall_xray ;;
             3) manage_xray ;;
             4) manage_argo ;;
@@ -1494,11 +1595,16 @@ menu() {
             6) change_config ;;
             7) disable_open_sub ;;
             8) export_menu ;;
+            9) xray2go_upload_links_latest_to_postgres ;;
             0) exit 0 ;;
-            *) red "无效的选项，请输入 0 到 8" ;;
+            *) red "无效的选项，请输入 0 到 9" ;;
         esac
         read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
     done
 }
 
-menu
+case "${1:-menu}" in
+    install) install_xray2go_all ;;
+    upload-db|upload-links) xray2go_upload_links_latest_to_postgres ;;
+    menu|*) menu ;;
+esac

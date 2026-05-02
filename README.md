@@ -133,7 +133,7 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 
 安装/导出节点后，若检测到 PostgreSQL 环境变量，脚本会自动把 `xray2go_links_latest.txt` 写入 `public.xray_node_configs.links`。上传失败不会中断安装。
 
-手动上传：
+Linux 手动上传：
 
 ```bash
 POSTGRES_HOST=127.0.0.1 \
@@ -145,7 +145,31 @@ XRAY2GO_LINKS_FILE=/root/xray2go_links_latest.txt \
 bash xray_2go_linux.sh upload-db
 ```
 
-本机 PostgreSQL 使用 peer 鉴权时：
+macOS 手动上传：
+
+```bash
+POSTGRES_HOST=127.0.0.1 \
+POSTGRES_PORT=5432 \
+POSTGRES_USER=xray \
+POSTGRES_PASSWORD='your_password' \
+POSTGRES_DB=xray \
+XRAY2GO_LINKS_FILE=$HOME/xray2go_links_latest.txt \
+bash xray_2go_macos.sh upload-db
+```
+
+Windows 手动上传：
+
+```powershell
+$env:POSTGRES_HOST = '127.0.0.1'
+$env:POSTGRES_PORT = '5432'
+$env:POSTGRES_USER = 'xray'
+$env:POSTGRES_PASSWORD = 'your_password'
+$env:POSTGRES_DB = 'xray'
+$env:XRAY2GO_LINKS_FILE = "$env:USERPROFILE\xray2go_links_latest.txt"
+.\xray_2go_win.ps1 upload-db
+```
+
+Linux 本机 PostgreSQL 使用 peer 鉴权时：
 
 ```bash
 XRAY2GO_PG_PEER_USER=postgres POSTGRES_DB=xray \

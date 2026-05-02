@@ -764,6 +764,128 @@ function Export-ProxyTxt {
 
 
 # ==========================================
+# PostgreSQL 上传 xray2go_links_latest.txt (xray2go+)
+# ==========================================
+function Test-PostgresEnabled {
+    return [bool]($env:DATABASE_URL -or $env:POSTGRES_HOST -or $env:POSTGRES_USER -or $env:POSTGRES_DB -or $env:PGHOST -or $env:PGUSER -or $env:PGDATABASE -or $env:PGSTATS_DSN)
+}
+
+function Quote-SqlText {
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return 'NULL' }
+    return "'" + ($Text -replace "'", "''") + "'"
+}
+
+function ConvertTo-SqlJsonb {
+    param($Value)
+    $json = ($Value | ConvertTo-Json -Depth 20 -Compress)
+    return (Quote-SqlText $json) + '::jsonb'
+}
+
+function Invoke-Xray2GoPsql {
+    param([string]$SqlFile)
+    $psql = Get-Command psql -ErrorAction SilentlyContinue
+    if (-not $psql) {
+        Write-Yellow 'psql 不可用，跳过 PostgreSQL 上传'
+        return $false
+    }
+
+    if ($env:DATABASE_URL) {
+        $env:PGPASSWORD = if ($env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD } else { $env:PGPASSWORD }
+        & psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -q -f $SqlFile
+    }
+    elseif ($env:PGSTATS_DSN) {
+        & psql $env:PGSTATS_DSN -v ON_ERROR_STOP=1 -q -f $SqlFile
+    }
+    else {
+        $env:PGHOST = if ($env:POSTGRES_HOST) { $env:POSTGRES_HOST } elseif ($env:PGHOST) { $env:PGHOST } else { '127.0.0.1' }
+        $env:PGPORT = if ($env:POSTGRES_PORT) { $env:POSTGRES_PORT } elseif ($env:PGPORT) { $env:PGPORT } else { '5432' }
+        $env:PGUSER = if ($env:POSTGRES_USER) { $env:POSTGRES_USER } elseif ($env:PGUSER) { $env:PGUSER } else { 'postgres' }
+        $env:PGPASSWORD = if ($env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD } else { $env:PGPASSWORD }
+        $env:PGDATABASE = if ($env:POSTGRES_DB) { $env:POSTGRES_DB } elseif ($env:PGDATABASE) { $env:PGDATABASE } else { 'xray' }
+        & psql -v ON_ERROR_STOP=1 -q -f $SqlFile
+    }
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Upload-LinksLatestToPostgres {
+    if (-not (Test-PostgresEnabled)) { return }
+
+    $linksFile = $env:XRAY2GO_LINKS_FILE
+    if (-not $linksFile) {
+        $candidates = @(
+            (Join-Path $ExportDir 'xray2go_links_latest.txt'),
+            (Join-Path (Get-Location).Path 'xray2go_links_latest.txt'),
+            (Join-Path $env:USERPROFILE 'xray2go_links_latest.txt'),
+            (Join-Path $WorkDir 'xray2go_links_latest.txt'),
+            $ClientDir
+        )
+        foreach ($candidate in $candidates) {
+            if ($candidate -and (Test-Path $candidate)) { $linksFile = $candidate; break }
+        }
+    }
+    if (-not $linksFile -or -not (Test-Path $linksFile)) {
+        Write-Yellow '未找到 xray2go_links_latest.txt，跳过 PostgreSQL 上传'
+        return
+    }
+
+    Load-Ports
+    $links = [ordered]@{}
+    $meta = [ordered]@{ source_file = $linksFile; platform = 'windows' }
+    $i = 0
+    foreach ($raw in (Get-Content $linksFile -ErrorAction SilentlyContinue)) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        $i++
+        if (($line -match '=') -and ($line -notmatch '^(vless|vmess|ss|trojan|hysteria2)://')) {
+            $parts = $line.Split('=', 2)
+            $key = $parts[0].Trim()
+            $value = $parts[1].Trim()
+            if ($value -match '://') { $links[$key] = $value } else { $meta[$key] = $value }
+        }
+        else {
+            $links["link_$i"] = $line
+        }
+    }
+
+    $ports = [ordered]@{}
+    foreach ($name in @('PORT','ARGO_PORT','GRPC_PORT','XHTTP_PORT')) {
+        $value = Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($value -match '^\d+$') { $ports[$name] = [int]$value }
+    }
+
+    $hostname = $env:COMPUTERNAME
+    if (-not $hostname) { $hostname = [System.Net.Dns]::GetHostName() }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $nodeBytes = [Text.Encoding]::UTF8.GetBytes("$hostname|$WorkDir")
+    $nodeHash = [BitConverter]::ToString($sha.ComputeHash($nodeBytes)).Replace('-', '').ToLower()
+    $nodeId = $nodeHash.Substring(0, 24)
+    $publicIp = Get-RealIP
+    $publicIpSql = if ($publicIp -and $publicIp -ne '127.0.0.1' -and $publicIp -notmatch ':') { (Quote-SqlText $publicIp) + '::inet' } else { 'NULL' }
+    $subUrl = if ($publicIp -and $script:PORT -and $script:password) { "http://${publicIp}:$($script:PORT)/$($script:password)" } else { '' }
+    $cdnHost = if ($meta.Contains('host')) { $meta['host'] } else { $CFIP }
+
+    $sql = @"
+CREATE TABLE IF NOT EXISTS public.xray_node_configs (
+ node_id text PRIMARY KEY, hostname text NOT NULL DEFAULT '', public_ip inet, install_dir text NOT NULL DEFAULT '', cdn_host text NOT NULL DEFAULT '', argo_domain text NOT NULL DEFAULT '', sub_url text NOT NULL DEFAULT '', uuid text NOT NULL DEFAULT '', public_key text NOT NULL DEFAULT '', ports jsonb NOT NULL DEFAULT '{}'::jsonb, links jsonb NOT NULL DEFAULT '{}'::jsonb, config_json jsonb NOT NULL DEFAULT '{}'::jsonb, raw_ports_env jsonb NOT NULL DEFAULT '{}'::jsonb, script_version text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO public.xray_node_configs (node_id, hostname, public_ip, install_dir, cdn_host, argo_domain, sub_url, uuid, public_key, ports, links, config_json, raw_ports_env, script_version, created_at, updated_at)
+VALUES ($(Quote-SqlText $nodeId), $(Quote-SqlText $hostname), $publicIpSql, $(Quote-SqlText $WorkDir), $(Quote-SqlText $cdnHost), '', $(Quote-SqlText $subUrl), $(Quote-SqlText $script:UUID), $(Quote-SqlText $script:publicKey), $(ConvertTo-SqlJsonb $ports), $(ConvertTo-SqlJsonb $links), '{}'::jsonb, $(ConvertTo-SqlJsonb $meta), 'links_latest_windows', now(), now())
+ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname, public_ip=EXCLUDED.public_ip, install_dir=EXCLUDED.install_dir, cdn_host=EXCLUDED.cdn_host, sub_url=EXCLUDED.sub_url, uuid=EXCLUDED.uuid, public_key=EXCLUDED.public_key, ports=EXCLUDED.ports, links=EXCLUDED.links, raw_ports_env=EXCLUDED.raw_ports_env, script_version=EXCLUDED.script_version, updated_at=now();
+"@
+    $tmpRoot = if ($env:TEMP) { $env:TEMP } else { [IO.Path]::GetTempPath() }
+    $tmp = Join-Path $tmpRoot "xray2go_links_pg_$([guid]::NewGuid().ToString('N')).sql"
+    $sql | Out-File -FilePath $tmp -Encoding UTF8
+    if (Invoke-Xray2GoPsql -SqlFile $tmp) {
+        Write-Green 'xray2go_links_latest.txt 已上传到 PostgreSQL 表 public.xray_node_configs'
+    }
+    else {
+        Write-Yellow 'PostgreSQL 上传失败，安装流程继续'
+    }
+    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+}
+
+
+# ==========================================
 # 服务管理
 # ==========================================
 function Start-XraySvc {
@@ -1235,17 +1357,19 @@ function Show-Menu {
         Write-Green  '7. 管理节点订阅'
         Write-Host   '==============='
         Write-SkyBlue '8. 导出代理为txt'
+        Write-SkyBlue '9. 上传 xray2go_links_latest.txt 到 PostgreSQL'
         Write-Host   '==============='
         Write-Red    '0. 退出脚本'
         Write-Host   '==========='
 
-        $choice = Read-Host '请输入选择(0-8)'
+        $choice = Read-Host '请输入选择(0-9)'
         Write-Host ''
 
         switch ($choice) {
             '1' {
                 if ($xrayStatus -eq 0) {
                     Write-Yellow 'Xray-2go 已经安装！'
+                    Upload-LinksLatestToPostgres
                 }
                 else {
                     Install-NSSM
@@ -1265,8 +1389,9 @@ function Show-Menu {
             '6' { Change-Config }
             '7' { Manage-Subscription }
             '8' { Show-ExportMenu }
+            '9' { Upload-LinksLatestToPostgres }
             '0' { exit 0 }
-            default { Write-Red '无效选项，请输入 0 到 8' }
+            default { Write-Red '无效选项，请输入 0 到 9' }
         }
 
         Write-Host ''
@@ -1276,4 +1401,16 @@ function Show-Menu {
 }
 
 # 入口
-Show-Menu
+switch ($args[0]) {
+    'install' {
+        if ((Check-Xray) -eq 0) {
+            Write-Yellow 'Xray-2go 已经安装！'
+            Upload-LinksLatestToPostgres
+        }
+        else {
+            Install-NSSM; Install-Caddy; Install-Jq; Install-Xray; Install-Services; Start-Sleep -Seconds 3; Get-Info; Install-CaddyService
+        }
+    }
+    { $_ -in @('upload-db', 'upload-links') } { Upload-LinksLatestToPostgres }
+    default { Show-Menu }
+}
