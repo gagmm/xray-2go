@@ -663,6 +663,25 @@ try:
 except Exception:
     config_json = {"_raw": config_file.read_text(errors="ignore")[:200000]} if config_file.exists() else {}
 node_id = os.environ.get("XRAY2GO_NODE_ID") or hashlib.sha256(f"{hostname}|{work_dir}".encode()).hexdigest()[:24]
+payload = {
+    "node_id": node_id,
+    "hostname": hostname,
+    "public_ip": public_ip if public_ip and public_ip != "127.0.0.1" else "",
+    "install_dir": str(work_dir),
+    "cdn_host": meta.get("host") or os.environ.get("XRAY2GO_CFIP", ""),
+    "argo_domain": os.environ.get("XRAY2GO_ARGO_DOMAIN", ""),
+    "sub_url": sub_url,
+    "uuid": p.get("UUID", ""),
+    "public_key": p.get("public_key", ""),
+    "ports": ports,
+    "links": links,
+    "config_json": config_json,
+    "raw_ports_env": {**p, **meta},
+    "script_version": "links_latest",
+}
+if os.environ.get("XRAY2GO_DB_WRITE_ONLY", "").lower() in ("1", "true", "yes", "on"):
+    print(f"SELECT public.xray2go_ingest_links({qjson(payload)});")
+    raise SystemExit
 print("""
 CREATE TABLE IF NOT EXISTS public.xray_node_configs (
     node_id text PRIMARY KEY,

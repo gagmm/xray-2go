@@ -177,6 +177,31 @@ XRAY2GO_LINKS_FILE=/root/xray2go_links_latest.txt \
 bash xray_2go_linux.sh upload-db
 ```
 
+#### 写入专用账号（推荐）
+
+如果担心节点数据库密码泄露，先用数据库管理员/owner 初始化一个只写入口：
+
+```bash
+psql -h 127.0.0.1 -U xray -d xray \
+  -v writer_password='请换成强密码' \
+  -f postgres_write_only_setup.sql
+```
+
+然后脚本使用写入专用账号上传：
+
+```bash
+POSTGRES_HOST=127.0.0.1 \
+POSTGRES_PORT=5432 \
+POSTGRES_USER=xray2go_writer \
+POSTGRES_PASSWORD='上面设置的强密码' \
+POSTGRES_DB=xray \
+XRAY2GO_DB_WRITE_ONLY=1 \
+XRAY2GO_LINKS_FILE=/root/xray2go_links_latest.txt \
+bash xray_2go_linux.sh upload-db
+```
+
+`xray2go_writer` 只能执行 `public.xray2go_ingest_links(jsonb)`，没有 `SELECT/UPDATE/DELETE/TRUNCATE` 节点表权限。
+
 ---
 
 ## 功能特性

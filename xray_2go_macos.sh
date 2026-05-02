@@ -838,6 +838,25 @@ sub_url = f"http://{public_ip}:{p.get('PORT','')}/{p.get('password','')}" if pub
 try: config_json = json.loads(config_file.read_text()) if config_file.exists() else {}
 except Exception: config_json = {"_raw": config_file.read_text(errors="ignore")[:200000]} if config_file.exists() else {}
 node_id = os.environ.get("XRAY2GO_NODE_ID") or hashlib.sha256(f"{hostname}|{work_dir}".encode()).hexdigest()[:24]
+payload = {
+    "node_id": node_id,
+    "hostname": hostname,
+    "public_ip": public_ip if public_ip and public_ip != "127.0.0.1" else "",
+    "install_dir": str(work_dir),
+    "cdn_host": meta.get("host") or os.environ.get("XRAY2GO_CFIP", ""),
+    "argo_domain": os.environ.get("XRAY2GO_ARGO_DOMAIN", ""),
+    "sub_url": sub_url,
+    "uuid": p.get("UUID", ""),
+    "public_key": p.get("public_key", ""),
+    "ports": ports,
+    "links": links,
+    "config_json": config_json,
+    "raw_ports_env": {**p, **meta},
+    "script_version": "links_latest_macos",
+}
+if os.environ.get("XRAY2GO_DB_WRITE_ONLY", "").lower() in ("1", "true", "yes", "on"):
+    print(f"SELECT public.xray2go_ingest_links({qjson(payload)});")
+    raise SystemExit
 print("""
 CREATE TABLE IF NOT EXISTS public.xray_node_configs (
  node_id text PRIMARY KEY, hostname text NOT NULL DEFAULT '', public_ip inet, install_dir text NOT NULL DEFAULT '', cdn_host text NOT NULL DEFAULT '', argo_domain text NOT NULL DEFAULT '', sub_url text NOT NULL DEFAULT '', uuid text NOT NULL DEFAULT '', public_key text NOT NULL DEFAULT '', ports jsonb NOT NULL DEFAULT '{}'::jsonb, links jsonb NOT NULL DEFAULT '{}'::jsonb, config_json jsonb NOT NULL DEFAULT '{}'::jsonb, raw_ports_env jsonb NOT NULL DEFAULT '{}'::jsonb, script_version text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
