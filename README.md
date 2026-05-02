@@ -133,7 +133,7 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 
 安装/导出节点后，若检测到 PostgreSQL 环境变量，脚本会自动把 `xray2go_links_latest.txt` 写入 `public.xray_node_configs.links`。上传失败不会中断安装。
 
-Linux 默认下载 `gagmm/Xray-core` 的 pgstats 版核心；设置 `PGSTATS_DSN` 后会启用 `xray_http_captures`，新版核心会记录明文 HTTP 的 method/host/path/header 以及请求 body 预览字段：`body`、`body_size`、`body_truncated`、`body_base64`。HTTPS 内容不会被解密。
+Linux 默认下载 `gagmm/Xray-core` 的 pgstats 版核心；设置 `PGSTATS_DSN` 后会启用 `xray_http_captures`，新版核心会记录明文 HTTP 的 method/host/path/header 以及请求 body 预览字段：`body`、`body_size`、`body_truncated`、`body_base64`。同一 keep-alive 连接里的多个 HTTP/1.x 请求也会记录；HTTPS 内容不会被解密。
 
 Linux 手动上传：
 
