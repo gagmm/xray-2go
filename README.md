@@ -121,8 +121,38 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 | `PORT` | 订阅服务端口 | 自动分配可用端口 |
 | `CFIP` | Cloudflare 优选 IP/域名 | `cdns.doon.eu.org` |
 | `CFPORT` | Cloudflare 优选端口 | `443` |
+| `PGSTATS_DSN` | Xray pgstats 运行统计 PostgreSQL DSN | 空 |
+| `DATABASE_URL` | 节点配置上传 PostgreSQL 连接串 | 空 |
+| `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | 节点配置上传 PostgreSQL 分项连接参数 | 空 |
+| `XRAY2GO_PG_PEER_USER` | 本机 PostgreSQL peer 鉴权用户，如 `postgres` | 空 |
 
 > 💡 **NAT 小鸡**需带 `PORT` 变量运行，并确保 PORT 之后的 2 个端口可用（GRPC/XHTTP），或安装后通过菜单更改端口。
+
+### PostgreSQL 节点配置上传（xray2go+）
+
+安装完成后，若检测到 PostgreSQL 环境变量，脚本会自动把节点配置写入 `public.xray_node_configs`。上传失败不会中断安装。
+
+```bash
+POSTGRES_HOST=127.0.0.1 \
+POSTGRES_PORT=5432 \
+POSTGRES_USER=xray \
+POSTGRES_PASSWORD='your_password' \
+POSTGRES_DB=xray \
+bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_linux.sh) install
+```
+
+本机 PostgreSQL 使用 peer 鉴权时：
+
+```bash
+XRAY2GO_PG_PEER_USER=postgres POSTGRES_DB=xray \
+bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_linux.sh) install
+```
+
+手动重传当前节点配置：
+
+```bash
+XRAY2GO_PG_PEER_USER=postgres POSTGRES_DB=xray ./xray_2go_linux.sh upload-db
+```
 
 ---
 
