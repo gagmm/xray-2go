@@ -19,6 +19,10 @@ $PortsEnvFile = "$WorkDir\ports.env"
 $NssmPath = "$WorkDir\nssm.exe"
 $CFIP = 'cdns.doon.eu.org'
 $CFPORT = '443'
+$script:REALITY_GRPC_SNI = if ($env:REALITY_GRPC_SNI) { $env:REALITY_GRPC_SNI } else { 'www.iij.ad.jp' }
+$script:REALITY_GRPC_TARGET = if ($env:REALITY_GRPC_TARGET) { $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_SNI }
+$script:REALITY_XHTTP_SNI = if ($env:REALITY_XHTTP_SNI) { $env:REALITY_XHTTP_SNI } else { 'www.nazhumi.com' }
+$script:REALITY_XHTTP_TARGET = if ($env:REALITY_XHTTP_TARGET) { $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_SNI }
 
 # ==========================================
 # 颜色输出
@@ -32,6 +36,21 @@ function Write-SkyBlue { param([string]$Text); Write-Host $Text -ForegroundColor
 # ==========================================
 # 工具函数
 # ==========================================
+function Set-RealityDefaults {
+    if (-not $script:REALITY_GRPC_SNI) {
+        $script:REALITY_GRPC_SNI = if ($env:REALITY_GRPC_SNI) { $env:REALITY_GRPC_SNI } else { 'www.iij.ad.jp' }
+    }
+    if (-not $script:REALITY_GRPC_TARGET) {
+        $script:REALITY_GRPC_TARGET = if ($env:REALITY_GRPC_TARGET) { $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_SNI }
+    }
+    if (-not $script:REALITY_XHTTP_SNI) {
+        $script:REALITY_XHTTP_SNI = if ($env:REALITY_XHTTP_SNI) { $env:REALITY_XHTTP_SNI } else { 'www.nazhumi.com' }
+    }
+    if (-not $script:REALITY_XHTTP_TARGET) {
+        $script:REALITY_XHTTP_TARGET = if ($env:REALITY_XHTTP_TARGET) { $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_SNI }
+    }
+}
+
 function Find-AvailablePort {
     param(
         [int]$StartPort = 1000,
@@ -80,7 +99,11 @@ function Save-Ports {
         "password=$($script:password)",
         "private_key=$($script:privateKey)",
         "public_key=$($script:publicKey)",
-        "UUID=$($script:UUID)"
+        "UUID=$($script:UUID)",
+        "REALITY_GRPC_TARGET=$($script:REALITY_GRPC_TARGET)",
+        "REALITY_GRPC_SNI=$($script:REALITY_GRPC_SNI)",
+        "REALITY_XHTTP_TARGET=$($script:REALITY_XHTTP_TARGET)",
+        "REALITY_XHTTP_SNI=$($script:REALITY_XHTTP_SNI)"
     )
     $content -join "`r`n" | Out-File -FilePath $PortsEnvFile -Encoding UTF8
 }
@@ -96,6 +119,7 @@ function Load-Ports {
             }
         }
     }
+    Set-RealityDefaults
 }
 
 function Get-RealIP {
@@ -339,6 +363,116 @@ function Install-Jq {
 }
 
 # ==========================================
+# REALITY/RealiTLScanner
+# ==========================================
+function Apply-RealityScannerResult {
+    param($ArchInfo)
+
+    Set-RealityDefaults
+
+    if (($env:REALITY_SCAN -ne '1') -and -not $env:REALITY_SCAN_ADDR -and -not $env:REALITY_SCAN_URL -and -not $env:REALITY_SCAN_IN) {
+        return
+    }
+
+    if (-not (Test-Path $WorkDir)) {
+        New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
+    }
+
+    $scanner = if ($env:REALITY_SCAN_BIN) { $env:REALITY_SCAN_BIN } else { Join-Path $WorkDir 'RealiTLScanner.exe' }
+    if (-not (Test-Path $scanner)) {
+        if ($ArchInfo.ARCH_ARG -ne '64') {
+            Write-Yellow "RealiTLScanner 当前脚本仅自动下载 windows-64 版本，当前架构 $($ArchInfo.ARCH_ARG) 不支持，保留默认 REALITY 域名。"
+            return
+        }
+        Write-Yellow '正在下载 RealiTLScanner...'
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri 'https://github.com/XTLS/RealiTLScanner/releases/download/v0.2.1/RealiTLScanner-windows-64.exe' -OutFile $scanner -UseBasicParsing
+        }
+        catch {
+            Write-Yellow "RealiTLScanner 下载失败，保留默认 REALITY 域名: $($_.Exception.Message)"
+            return
+        }
+    }
+
+    $out = if ($env:REALITY_SCAN_OUT) { $env:REALITY_SCAN_OUT } else { Join-Path $env:TEMP 'realitlscanner-out.csv' }
+    $log = if ($env:REALITY_SCAN_LOG) { $env:REALITY_SCAN_LOG } else { Join-Path $env:TEMP 'realitlscanner.log' }
+    $errLog = "$log.err"
+    $scanArgs = @()
+    if ($env:REALITY_SCAN_IN) {
+        $scanArgs += @('-in', $env:REALITY_SCAN_IN)
+    }
+    elseif ($env:REALITY_SCAN_URL) {
+        $scanArgs += @('-url', $env:REALITY_SCAN_URL)
+    }
+    elseif ($env:REALITY_SCAN_ADDR) {
+        $scanArgs += @('-addr', $env:REALITY_SCAN_ADDR)
+    }
+    else {
+        Write-Yellow '已启用 REALITY_SCAN，但未设置 REALITY_SCAN_ADDR / REALITY_SCAN_URL / REALITY_SCAN_IN，保留默认 REALITY 域名。'
+        return
+    }
+
+    $scanArgs += @(
+        '-port', (if ($env:REALITY_SCAN_PORT) { $env:REALITY_SCAN_PORT } else { '443' }),
+        '-thread', (if ($env:REALITY_SCAN_THREAD) { $env:REALITY_SCAN_THREAD } else { '5' }),
+        '-timeout', (if ($env:REALITY_SCAN_TIMEOUT) { $env:REALITY_SCAN_TIMEOUT } else { '5' }),
+        '-out', $out
+    )
+
+    $maxSeconds = 180
+    if ($env:REALITY_SCAN_MAX_SECONDS) { [void][int]::TryParse($env:REALITY_SCAN_MAX_SECONDS, [ref]$maxSeconds) }
+
+    Write-Yellow '正在用 RealiTLScanner 扫描 REALITY 伪装目标...'
+    try {
+        $proc = Start-Process -FilePath $scanner -ArgumentList $scanArgs -NoNewWindow -PassThru -RedirectStandardOutput $log -RedirectStandardError $errLog
+        try {
+            Wait-Process -Id $proc.Id -Timeout $maxSeconds -ErrorAction Stop
+        }
+        catch {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            Write-Yellow "RealiTLScanner 扫描超时，保留默认 REALITY 域名。日志：$log"
+            return
+        }
+        if ($proc.ExitCode -ne 0) {
+            Write-Yellow "RealiTLScanner 扫描失败，保留默认 REALITY 域名。日志：$log"
+            return
+        }
+    }
+    catch {
+        Write-Yellow "RealiTLScanner 扫描失败，保留默认 REALITY 域名: $($_.Exception.Message)"
+        return
+    }
+
+    if (-not (Test-Path $out)) {
+        Write-Yellow 'RealiTLScanner 没有输出结果，保留默认 REALITY 域名。'
+        return
+    }
+    $line = Get-Content $out -ErrorAction SilentlyContinue | Select-Object -Skip 1 | Where-Object { $_ -and (($_ -split ',').Count -ge 2) } | Select-Object -First 1
+    if (-not $line) {
+        Write-Yellow 'RealiTLScanner 没有可用结果，保留默认 REALITY 域名。'
+        return
+    }
+
+    $cols = $line -split ','
+    $ip = $cols[0].Trim(' ', '"', "`r")
+    $origin = $cols[1].Trim(' ', '"', "`r")
+    $cert = if ($cols.Count -gt 2) { $cols[2].Trim(' ', '"', "`r") } else { '' }
+    $sni = $cert
+    if (-not $sni -or $sni.StartsWith('*.')) { $sni = $origin }
+    if (-not $ip -or -not $sni -or $sni.Contains('*')) {
+        Write-Yellow 'RealiTLScanner 结果不可用，保留默认 REALITY 域名。'
+        return
+    }
+
+    $script:REALITY_GRPC_TARGET = $ip
+    $script:REALITY_GRPC_SNI = $sni
+    $script:REALITY_XHTTP_TARGET = $ip
+    $script:REALITY_XHTTP_SNI = $sni
+    Write-Green "REALITY 伪装目标已切换为：target=${ip}:443, sni=${sni}（默认域名仍作为失败回退）"
+}
+
+# ==========================================
 # 安装 Xray + Cloudflared
 # ==========================================
 function Install-Xray {
@@ -351,6 +485,9 @@ function Install-Xray {
     if (-not (Test-Path $WorkDir)) {
         New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
     }
+
+    # REALITY 伪装域名：默认使用内置回退，可通过 RealiTLScanner 显式扫描替换
+    Apply-RealityScannerResult -ArchInfo $archInfo
 
     $script:UUID = New-UUID
     $script:password = New-Password
@@ -467,8 +604,8 @@ function Install-Xray {
                 streamSettings = @{
                     network = 'xhttp'; security = 'reality'
                     realitySettings = @{
-                        target = 'www.nazhumi.com:443'; xver = 0
-                        serverNames = @('www.nazhumi.com')
+                        target = "$($script:REALITY_XHTTP_TARGET):443"; xver = 0
+                        serverNames = @($script:REALITY_XHTTP_SNI)
                         privateKey = $script:privateKey; shortIds = @('')
                     }
                 }
@@ -480,8 +617,8 @@ function Install-Xray {
                 streamSettings = @{
                     network = 'grpc'; security = 'reality'
                     realitySettings = @{
-                        dest = 'www.iij.ad.jp:443'
-                        serverNames = @('www.iij.ad.jp')
+                        dest = "$($script:REALITY_GRPC_TARGET):443"
+                        serverNames = @($script:REALITY_GRPC_SNI)
                         privateKey = $script:privateKey; shortIds = @('')
                     }
                     grpcSettings = @{ serviceName = 'grpc' }
@@ -635,9 +772,9 @@ function Get-Info {
     $vmessBase64 = ConvertTo-Base64 -Text $vmessJson
 
     $urlLines = @(
-        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}",
+        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)??encryption=none&security=reality&sni=$($script:REALITY_GRPC_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=$($script:REALITY_GRPC_SNI)&serviceName=grpc&mode=gun#${isp}",
         '',
-        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}",
+        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=$($script:REALITY_XHTTP_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}",
         '',
         "vless://$($script:UUID)@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}",
         '',

@@ -74,6 +74,10 @@ assign_ports() {
 export UUID=${UUID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}
 export CFIP=${CFIP:-'cdns.doon.eu.org'}
 export CFPORT=${CFPORT:-'443'}
+export REALITY_GRPC_SNI=${REALITY_GRPC_SNI:-'www.iij.ad.jp'}
+export REALITY_GRPC_TARGET=${REALITY_GRPC_TARGET:-$REALITY_GRPC_SNI}
+export REALITY_XHTTP_SNI=${REALITY_XHTTP_SNI:-'www.nazhumi.com'}
+export REALITY_XHTTP_TARGET=${REALITY_XHTTP_TARGET:-$REALITY_XHTTP_SNI}
 
 # 获取系统架构
 get_arch() {
@@ -126,6 +130,92 @@ get_realip() {
     else
         echo "127.0.0.1"
     fi
+}
+
+
+# 使用 RealiTLScanner 自动选择 REALITY 伪装域名；失败时保留默认回退域名。
+# macOS 没有官方发布二进制；如需扫描，请设置 REALITY_SCAN_BIN 指向可执行文件。
+reality_apply_scanner_result() {
+    local arch_arg="$1"
+    export REALITY_GRPC_SNI=${REALITY_GRPC_SNI:-'www.iij.ad.jp'}
+    export REALITY_GRPC_TARGET=${REALITY_GRPC_TARGET:-$REALITY_GRPC_SNI}
+    export REALITY_XHTTP_SNI=${REALITY_XHTTP_SNI:-'www.nazhumi.com'}
+    export REALITY_XHTTP_TARGET=${REALITY_XHTTP_TARGET:-$REALITY_XHTTP_SNI}
+
+    if [[ "${REALITY_SCAN:-0}" != "1" && -z "${REALITY_SCAN_ADDR:-}" && -z "${REALITY_SCAN_URL:-}" && -z "${REALITY_SCAN_IN:-}" ]]; then
+        return 0
+    fi
+
+    [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}"
+    local scanner="${REALITY_SCAN_BIN:-${work_dir}/RealiTLScanner}"
+    if [[ ! -x "$scanner" ]]; then
+        yellow "macOS 暂无官方 RealiTLScanner 发布二进制；请设置 REALITY_SCAN_BIN 指向可执行文件，保留默认 REALITY 域名。"
+        return 0
+    fi
+
+    local out="${REALITY_SCAN_OUT:-/tmp/realitlscanner-out.csv}"
+    local log="${REALITY_SCAN_LOG:-/tmp/realitlscanner.log}"
+    local args=()
+    if [[ -n "${REALITY_SCAN_IN:-}" ]]; then
+        args=(-in "$REALITY_SCAN_IN")
+    elif [[ -n "${REALITY_SCAN_URL:-}" ]]; then
+        args=(-url "$REALITY_SCAN_URL")
+    elif [[ -n "${REALITY_SCAN_ADDR:-}" ]]; then
+        args=(-addr "$REALITY_SCAN_ADDR")
+    else
+        yellow "已启用 REALITY_SCAN，但未设置 REALITY_SCAN_ADDR / REALITY_SCAN_URL / REALITY_SCAN_IN，保留默认 REALITY 域名。"
+        return 0
+    fi
+
+    yellow "正在用 RealiTLScanner 扫描 REALITY 伪装目标..."
+    local timeout_cmd=""
+    if command -v gtimeout >/dev/null 2>&1; then
+        timeout_cmd="gtimeout"
+    elif command -v timeout >/dev/null 2>&1; then
+        timeout_cmd="timeout"
+    fi
+
+    if [[ -n "$timeout_cmd" ]]; then
+        "$timeout_cmd" "${REALITY_SCAN_MAX_SECONDS:-180}" "$scanner" "${args[@]}" \
+            -port "${REALITY_SCAN_PORT:-443}" \
+            -thread "${REALITY_SCAN_THREAD:-5}" \
+            -timeout "${REALITY_SCAN_TIMEOUT:-5}" \
+            -out "$out" >"$log" 2>&1
+    else
+        "$scanner" "${args[@]}" \
+            -port "${REALITY_SCAN_PORT:-443}" \
+            -thread "${REALITY_SCAN_THREAD:-5}" \
+            -timeout "${REALITY_SCAN_TIMEOUT:-5}" \
+            -out "$out" >"$log" 2>&1
+    fi
+    if [ $? -ne 0 ]; then
+        yellow "RealiTLScanner 扫描失败或超时，保留默认 REALITY 域名。日志：$log"
+        return 0
+    fi
+
+    local line ip origin cert sni
+    line=$(awk -F',' 'NR>1 && $1 != "" && $2 != "" {print; exit}' "$out" 2>/dev/null || true)
+    if [[ -z "$line" ]]; then
+        yellow "RealiTLScanner 没有可用结果，保留默认 REALITY 域名。"
+        return 0
+    fi
+    ip=$(echo "$line" | awk -F',' '{print $1}' | tr -d ' "\r')
+    origin=$(echo "$line" | awk -F',' '{print $2}' | tr -d ' "\r')
+    cert=$(echo "$line" | awk -F',' '{print $3}' | tr -d ' "\r')
+    sni="$cert"
+    if [[ -z "$sni" || "$sni" == \*.* ]]; then
+        sni="$origin"
+    fi
+    if [[ -z "$ip" || -z "$sni" || "$sni" == *'*'* ]]; then
+        yellow "RealiTLScanner 结果不可用，保留默认 REALITY 域名。"
+        return 0
+    fi
+
+    export REALITY_GRPC_TARGET="$ip"
+    export REALITY_GRPC_SNI="$sni"
+    export REALITY_XHTTP_TARGET="$ip"
+    export REALITY_XHTTP_SNI="$sni"
+    green "REALITY 伪装目标已切换为：target=${ip}:443, sni=${sni}（默认域名仍作为失败回退）"
 }
 
 # 检查 xray 是否已安装和运行
@@ -296,6 +386,9 @@ install_xray() {
     # 自动分配端口
     assign_ports
 
+    # REALITY 伪装域名：默认使用内置回退，可通过 RealiTLScanner 显式扫描替换
+    reality_apply_scanner_result "$ARCH_ARG"
+
     # 创建工作目录
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 755 "${work_dir}"
     [ ! -d "${launchd_dir}" ] && mkdir -p "${launchd_dir}"
@@ -370,6 +463,10 @@ password=$password
 private_key=$private_key
 public_key=$public_key
 UUID=$UUID
+REALITY_GRPC_TARGET=$REALITY_GRPC_TARGET
+REALITY_GRPC_SNI=$REALITY_GRPC_SNI
+REALITY_XHTTP_TARGET=$REALITY_XHTTP_TARGET
+REALITY_XHTTP_SNI=$REALITY_XHTTP_SNI
 EOF
 
     # 生成配置文件
@@ -410,14 +507,14 @@ EOF
     {
       "listen":"::", "port": $XHTTP_PORT, "protocol": "vless",
       "settings": {"clients": [{"id": "$UUID"}], "decryption": "none"},
-      "streamSettings": {"network": "xhttp", "security": "reality", "realitySettings": {"target": "www.nazhumi.com:443", "xver": 0, "serverNames":
-      ["www.nazhumi.com"], "privateKey": "$private_key", "shortIds": [""]}},
+      "streamSettings": {"network": "xhttp", "security": "reality", "realitySettings": {"target": "${REALITY_XHTTP_TARGET}:443", "xver": 0, "serverNames":
+      ["${REALITY_XHTTP_SNI}"], "privateKey": "$private_key", "shortIds": [""]}},
       "sniffing": {"enabled": true, "destOverride": ["http","tls","quic"]}
     },
     {
       "listen":"::", "port":$GRPC_PORT, "protocol":"vless",
       "settings":{"clients":[{"id":"$UUID"}], "decryption":"none"},
-      "streamSettings":{"network":"grpc", "security":"reality", "realitySettings":{"dest":"www.iij.ad.jp:443", "serverNames":["www.iij.ad.jp"],
+      "streamSettings":{"network":"grpc", "security":"reality", "realitySettings":{"dest":"${REALITY_GRPC_TARGET}:443", "serverNames":["${REALITY_GRPC_SNI}"],
       "privateKey":"$private_key", "shortIds":[""]}, "grpcSettings":{"serviceName":"grpc"}},
       "sniffing":{"enabled":true, "destOverride":["http","tls","quic"]}
     }
@@ -437,6 +534,10 @@ load_ports() {
     if [ -f "${work_dir}/ports.env" ]; then
         source "${work_dir}/ports.env"
     fi
+    export REALITY_GRPC_SNI=${REALITY_GRPC_SNI:-'www.iij.ad.jp'}
+    export REALITY_GRPC_TARGET=${REALITY_GRPC_TARGET:-$REALITY_GRPC_SNI}
+    export REALITY_XHTTP_SNI=${REALITY_XHTTP_SNI:-'www.nazhumi.com'}
+    export REALITY_XHTTP_TARGET=${REALITY_XHTTP_TARGET:-$REALITY_XHTTP_SNI}
 }
 
 # macOS launchd 守护进程
@@ -570,9 +671,9 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=www.iij.ad.jp&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=www.iij.ad.jp&serviceName=grpc&mode=gun#${isp}
+vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}
 
-vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=www.nazhumi.com&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
+vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
 
 vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}
 
