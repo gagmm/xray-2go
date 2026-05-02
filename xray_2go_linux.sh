@@ -528,11 +528,11 @@ EOF
 
     # 安装完成后自动导出一份
     export_proxy_txt "auto"
-    xray2go_upload_config_to_postgres || true
+    xray2go_upload_links_latest_to_postgres || true
 }
 
 # ==========================================
-# PostgreSQL 节点配置上传 (xray2go+)
+# PostgreSQL 上传 xray2go_links_latest.txt (xray2go+)
 # ==========================================
 xray2go_postgres_enabled() {
     [[ -n "${DATABASE_URL:-}" || -n "${POSTGRES_HOST:-}" || -n "${POSTGRES_USER:-}" || -n "${POSTGRES_DB:-}" || -n "${PGHOST:-}" || -n "${PGUSER:-}" || -n "${PGDATABASE:-}" || -n "${PGSTATS_DSN:-}" || -n "${XRAY2GO_PG_PEER_USER:-}" ]]
@@ -550,7 +550,7 @@ xray2go_ensure_psql() {
     elif command -v apk &>/dev/null; then
         apk add postgresql-client >/dev/null 2>&1 || true
     fi
-    command -v psql &>/dev/null || { yellow "psql 不可用，跳过 PostgreSQL 节点配置上传"; return 1; }
+    command -v psql &>/dev/null || { yellow "psql 不可用，跳过 PostgreSQL 上传"; return 1; }
 }
 
 xray2go_psql_exec() {
@@ -574,26 +574,40 @@ xray2go_psql_exec() {
     fi
 }
 
-xray2go_upload_config_to_postgres() {
+xray2go_upload_links_latest_to_postgres() {
     xray2go_postgres_enabled || return 0
-    [ -f "${work_dir}/ports.env" ] || { yellow "${work_dir}/ports.env 不存在，跳过 PostgreSQL 节点配置上传"; return 0; }
     xray2go_ensure_psql || return 0
-    load_ports
+
+    local links_file="${XRAY2GO_LINKS_FILE:-}"
+    if [[ -z "$links_file" ]]; then
+        for candidate in \
+            "${export_dir}/xray2go_links_latest.txt" \
+            "$(pwd)/xray2go_links_latest.txt" \
+            "${HOME}/xray2go_links_latest.txt" \
+            "${work_dir}/xray2go_links_latest.txt" \
+            "${work_dir}/url.txt"; do
+            if [[ -f "$candidate" ]]; then
+                links_file="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -f "$links_file" ]] || { yellow "未找到 xray2go_links_latest.txt，跳过 PostgreSQL 上传"; return 0; }
 
     local IP argodomain tmp_sql
     IP=$(get_realip)
     argodomain=""
-    if [ -f "${work_dir}/argo.log" ]; then
+    if [[ -f "${work_dir}/argo.log" ]]; then
         argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
     fi
     tmp_sql=$(mktemp)
 
     XRAY2GO_WORK_DIR="${work_dir}" \
     XRAY2GO_CONFIG_DIR="${config_dir}" \
-    XRAY2GO_PUBLIC_IP="${IP}" \
-    XRAY2GO_ARGO_DOMAIN="${argodomain}" \
-    XRAY2GO_CFIP="${CFIP}" \
-    XRAY2GO_CFPORT="${CFPORT}" \
+    XRAY2GO_LINKS_FILE="$links_file" \
+    XRAY2GO_PUBLIC_IP="$IP" \
+    XRAY2GO_ARGO_DOMAIN="$argodomain" \
+    XRAY2GO_CFIP="$CFIP" \
     python3 - <<'PYEOF' > "$tmp_sql"
 import hashlib
 import json
@@ -603,10 +617,10 @@ from pathlib import Path
 
 work_dir = Path(os.environ["XRAY2GO_WORK_DIR"])
 ports_env = work_dir / "ports.env"
-url_file = work_dir / "url.txt"
 config_file = Path(os.environ.get("XRAY2GO_CONFIG_DIR", str(work_dir / "config.json")))
+links_file = Path(os.environ["XRAY2GO_LINKS_FILE"])
 
-def read_ports(path):
+def read_env(path):
     data = {}
     if path.exists():
         for line in path.read_text(errors="ignore").splitlines():
@@ -625,12 +639,23 @@ def q(value):
 def qjson(value):
     return q(json.dumps(value, ensure_ascii=False, sort_keys=True)) + "::jsonb"
 
-p = read_ports(ports_env)
+p = read_env(ports_env)
+links = {}
+meta = {"source_file": str(links_file)}
+for i, line in enumerate([x.strip() for x in links_file.read_text(errors="ignore").splitlines() if x.strip() and not x.strip().startswith("#")], 1):
+    if "=" in line and not line.startswith(("vless://", "vmess://", "ss://", "trojan://", "hysteria2://")):
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if "://" in v:
+            links[k or f"link_{i}"] = v
+        else:
+            meta[k or f"meta_{i}"] = v
+    else:
+        links[f"link_{i}"] = line
+
 hostname = socket.gethostname()
 public_ip = os.environ.get("XRAY2GO_PUBLIC_IP", "").strip().strip("[]")
 public_ip_sql = "NULL" if not public_ip or public_ip == "127.0.0.1" else q(public_ip) + "::inet"
-links_list = [line.strip() for line in url_file.read_text(errors="ignore").splitlines() if line.strip()] if url_file.exists() else []
-links = {f"link_{i+1}": v for i, v in enumerate(links_list)}
 ports = {k: int(v) for k, v in p.items() if k.endswith("PORT") and str(v).isdigit()}
 sub_url = f"http://{public_ip}:{p.get('PORT','')}/{p.get('password','')}" if public_ip and p.get("PORT") and p.get("password") else ""
 try:
@@ -664,8 +689,8 @@ INSERT INTO public.xray_node_configs (
     uuid, public_key, ports, links, config_json, raw_ports_env, script_version,
     created_at, updated_at
 ) VALUES (
-    {q(node_id)}, {q(hostname)}, {public_ip_sql}, {q(str(work_dir))}, {q(os.environ.get('XRAY2GO_CFIP',''))}, {q(os.environ.get('XRAY2GO_ARGO_DOMAIN',''))}, {q(sub_url)},
-    {q(p.get('UUID',''))}, {q(p.get('public_key',''))}, {qjson(ports)}, {qjson(links)}, {qjson(config_json)}, {qjson(p)}, {q('remote-main')},
+    {q(node_id)}, {q(hostname)}, {public_ip_sql}, {q(str(work_dir))}, {q(meta.get('host') or os.environ.get('XRAY2GO_CFIP',''))}, {q(os.environ.get('XRAY2GO_ARGO_DOMAIN',''))}, {q(sub_url)},
+    {q(p.get('UUID',''))}, {q(p.get('public_key',''))}, {qjson(ports)}, {qjson(links)}, {qjson(config_json)}, {qjson({**p, **meta})}, {q('links_latest')},
     now(), now()
 )
 ON CONFLICT (node_id) DO UPDATE SET
@@ -687,9 +712,9 @@ ON CONFLICT (node_id) DO UPDATE SET
 PYEOF
 
     if xray2go_psql_exec "$tmp_sql"; then
-        green "节点配置已上传到 PostgreSQL 表 public.xray_node_configs"
+        green "xray2go_links_latest.txt 已上传到 PostgreSQL 表 public.xray_node_configs"
     else
-        yellow "PostgreSQL 节点配置上传失败，安装流程继续"
+        yellow "PostgreSQL 上传失败，安装流程继续"
     fi
     rm -f "$tmp_sql"
 }
@@ -983,19 +1008,11 @@ if [ ${check_xray} -eq 1 ]; then
 elif [ ${check_xray} -eq 0 ]; then
     yellow "xray 正在运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "xray 尚未安装!\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1017,19 +1034,11 @@ if [ ${check_xray} -eq 0 ]; then
 elif [ ${check_xray} -eq 1 ]; then
     yellow "xray 未运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "xray 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1051,19 +1060,11 @@ if [ ${check_xray} -eq 0 ]; then
 elif [ ${check_xray} -eq 1 ]; then
     yellow "xray 未运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "xray 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1085,19 +1086,11 @@ if [ ${check_argo} -eq 1 ]; then
 elif [ ${check_argo} -eq 0 ]; then
     green "Argo 服务正在运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "Argo 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1119,19 +1112,11 @@ if [ ${check_argo} -eq 0 ]; then
 elif [ ${check_argo} -eq 1 ]; then
     yellow "Argo 服务未运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "Argo 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1154,19 +1139,11 @@ if [ ${check_argo} -eq 0 ]; then
 elif [ ${check_argo} -eq 1 ]; then
     yellow "Argo 服务未运行\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     yellow "Argo 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1188,11 +1165,7 @@ if command -v caddy &>/dev/null; then
 else
     yellow "caddy 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1213,11 +1186,7 @@ if command -v caddy &>/dev/null; then
 else
     yellow "caddy 尚未安装！\n"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1454,11 +1423,7 @@ if [ ${check_xray} -eq 0 ]; then
 else
     yellow "xray—2go 尚未安装！"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1487,11 +1452,7 @@ manage_argo() {
 if [ ${check_argo} -eq 2 ]; then
     yellow "Argo 尚未安装！"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 else
     load_ports
     clear
@@ -1572,11 +1533,7 @@ EOF
                 else
                     yellow "当前使用固定隧道，无法获取临时隧道"
                     sleep 2
-                    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+                    menu
                 fi
             else
                 if grep -q "ExecStart=.*--url http://localhost:${ARGO_PORT}" /etc/systemd/system/tunnel.service; then
@@ -1585,11 +1542,7 @@ esac
                 else
                     yellow "当前使用固定隧道，无法获取临时隧道"
                     sleep 2
-                    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+                    menu
                 fi
             fi
             ;;
@@ -1669,11 +1622,7 @@ if [ ${check_xray} -eq 0 ]; then
 else
     yellow "Xray-2go 尚未安装或未运行,请先安装或启动Xray-2go"
     sleep 1
-    case "${1:-menu}" in
-    install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
-    menu|*) menu ;;
-esac
+    menu
 fi
 }
 
@@ -1681,11 +1630,13 @@ fi
 trap 'red "已取消操作"; exit' INT
 
 install_xray2go_all() {
-    if check_xray &>/dev/null; then
+    check_xray &>/dev/null; local xray_state=$?
+    if [ ${xray_state} -eq 0 ]; then
         yellow "Xray-2go 已经安装！"
-        xray2go_upload_config_to_postgres || true
+        xray2go_upload_links_latest_to_postgres || true
         return 0
     fi
+
     install_caddy
     manage_packages install jq unzip iptables openssl coreutils lsof
     install_xray
@@ -1737,7 +1688,7 @@ while true; do
    echo   "==============="
    purple "9. ssh综合工具箱"
    purple "10. 安装singbox四合一"
-   skyblue "11. 上传节点配置至 PostgreSQL"
+   skyblue "11. 上传 xray2go_links_latest.txt 到 PostgreSQL"
    echo   "==============="
    red    "0. 退出脚本"
    echo   "==========="
@@ -1754,15 +1705,15 @@ while true; do
         8) export_menu ;;
         9) clear && curl -fsSL https://raw.githubusercontent.com/eooce/ssh_tool/main/ssh_tool.sh -o ssh_tool.sh && chmod +x ssh_tool.sh && ./ssh_tool.sh ;;
         10) clear && bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
-        11) xray2go_upload_config_to_postgres ;;
+        11) xray2go_upload_links_latest_to_postgres ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 10" ;;
+        *) red "无效的选项，请输入 0 到 11" ;;
    esac
    read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
 done
 }
 case "${1:-menu}" in
     install) install_xray2go_all ;;
-    upload-db) xray2go_upload_config_to_postgres ;;
+    upload-db|upload-links) xray2go_upload_links_latest_to_postgres ;;
     menu|*) menu ;;
 esac
