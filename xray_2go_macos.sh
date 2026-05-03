@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ===========================================
-# Xray-2go macOS 适配版 (root 环境，无 Homebrew)
-# 所有依赖直接下载二进制，不依赖 brew
+# Xray-2go macOS 适配版（用户态优先，无 Homebrew）
+# 所有依赖直接下载二进制，不依赖 brew；无 sudo 时安装到 ~/.xray/bin
 # 自动选择可用端口，支持导出代理为 txt
 # ===========================================
 
-export PATH="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+export PATH="$HOME/.xray/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 # 定义颜色
 re="\033[0m"
@@ -25,6 +25,7 @@ reading() { read -p "$(red "$1")" "$2"; }
 # 定义常量
 server_name="xray"
 work_dir="$HOME/.xray"
+bin_dir="${work_dir}/bin"
 config_dir="${work_dir}/config.json"
 client_dir="${work_dir}/url.txt"
 launchd_dir="$HOME/Library/LaunchAgents"
@@ -385,11 +386,12 @@ manage_packages() {
             yellow "正在安装 ${package}..."
             case "$package" in
                 jq)
-                    curl -sLo /usr/local/bin/jq "https://github.com/jqlang/jq/releases/latest/download/jq-macos-${ARCH}"
-                    chmod +x /usr/local/bin/jq
-                    xattr -d com.apple.quarantine /usr/local/bin/jq 2>/dev/null
-                    if command -v jq &>/dev/null; then
-                        green "jq 安装成功"
+                    mkdir -p "${bin_dir}"
+                    curl -sLo "${bin_dir}/jq" "https://github.com/jqlang/jq/releases/latest/download/jq-macos-${ARCH}"
+                    chmod +x "${bin_dir}/jq"
+                    xattr -d com.apple.quarantine "${bin_dir}/jq" 2>/dev/null
+                    if "${bin_dir}/jq" --version >/dev/null 2>&1; then
+                        green "jq 安装成功：${bin_dir}/jq"
                     else
                         red "jq 安装失败"
                     fi
@@ -399,7 +401,7 @@ manage_packages() {
 #!/bin/bash
 echo ""
 echo "========== 订阅二维码 =========="
-echo "(macOS root 环境暂不支持终端二维码)"
+echo "(macOS 用户态环境暂不支持终端二维码)"
 echo "请复制以下链接到浏览器或手机扫码工具："
 echo ""
 echo "$1"
@@ -417,11 +419,11 @@ QREOF
         elif [ "$action" == "uninstall" ]; then
             case "$package" in
                 jq)
-                    rm -f /usr/local/bin/jq
+                    rm -f "${bin_dir}/jq" /usr/local/bin/jq 2>/dev/null
                     green "jq 已卸载"
                     ;;
                 caddy)
-                    rm -f /usr/local/bin/caddy
+                    rm -f "${bin_dir}/caddy" /usr/local/bin/caddy 2>/dev/null
                     green "caddy 已卸载"
                     ;;
                 *)
@@ -435,8 +437,9 @@ QREOF
 
 # 安装 caddy - 直接下载二进制
 install_caddy() {
+    mkdir -p "${bin_dir}"
     if command -v caddy &>/dev/null; then
-        green "caddy already installed"
+        green "caddy already installed: $(command -v caddy)"
         return
     fi
     yellow "正在下载安装 caddy..."
@@ -453,15 +456,14 @@ install_caddy() {
         return 1
     fi
 
-    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
     tar -xzf /tmp/caddy.tar.gz -C /tmp/ 2>/dev/null
-    mv /tmp/caddy /usr/local/bin/caddy 2>/dev/null
-    chmod +x /usr/local/bin/caddy
-    xattr -d com.apple.quarantine /usr/local/bin/caddy 2>/dev/null
+    mv /tmp/caddy "${bin_dir}/caddy" 2>/dev/null
+    chmod +x "${bin_dir}/caddy"
+    xattr -d com.apple.quarantine "${bin_dir}/caddy" 2>/dev/null
     rm -f /tmp/caddy.tar.gz /tmp/LICENSE /tmp/README.md
 
-    if command -v caddy &>/dev/null; then
-        green "caddy v${CADDY_VERSION} 安装成功"
+    if "${bin_dir}/caddy" version >/dev/null 2>&1; then
+        green "caddy v${CADDY_VERSION} 安装成功：${bin_dir}/caddy"
     else
         red "caddy 安装失败"
     fi
@@ -813,7 +815,7 @@ EOF
 # Caddy launchd 服务
 macos_caddy_launchd() {
     local caddy_path
-    caddy_path=$(which caddy 2>/dev/null || echo "/usr/local/bin/caddy")
+    caddy_path=$(command -v caddy 2>/dev/null || echo "${bin_dir}/caddy")
 
     cat > "${launchd_dir}/com.caddy.service.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1435,17 +1437,17 @@ uninstall_xray() {
             rm -f "${launchd_dir}/com.cloudflare.tunnel.plist"
             rm -f "${launchd_dir}/com.caddy.service.plist"
 
-            rm -f /usr/local/bin/2go 2>/dev/null
+            rm -f "${bin_dir}/2go" /usr/local/bin/2go 2>/dev/null
 
             reading "\n是否卸载 caddy？(y/n): " choice
             case "${choice}" in
-                y|Y) rm -f /usr/local/bin/caddy; green "caddy 已卸载" ;;
+                y|Y) rm -f "${bin_dir}/caddy" /usr/local/bin/caddy 2>/dev/null; green "caddy 已卸载" ;;
                 *) yellow "取消卸载 caddy\n" ;;
             esac
 
             reading "\n是否卸载 jq？(y/n): " choice
             case "${choice}" in
-                y|Y) rm -f /usr/local/bin/jq; green "jq 已卸载" ;;
+                y|Y) rm -f "${bin_dir}/jq" /usr/local/bin/jq 2>/dev/null; green "jq 已卸载" ;;
                 *) yellow "取消卸载 jq\n" ;;
             esac
 
@@ -1461,15 +1463,21 @@ uninstall_xray() {
 
 # 创建快捷指令
 create_shortcut() {
+    mkdir -p "${bin_dir}"
     cat > "${work_dir}/2go.sh" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://github.com/eooce/xray-2go/raw/main/xray_2go.sh) $1
+bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_macos.sh) "$@"
 EOF
     chmod +x "${work_dir}/2go.sh"
-    [ ! -d /usr/local/bin ] && mkdir -p /usr/local/bin
-    ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go
-    if [ -f /usr/local/bin/2go ]; then
-        green "\n快捷指令 2go 创建成功\n"
+
+    if [ -w /usr/local/bin ] || { [ ! -e /usr/local/bin ] && mkdir -p /usr/local/bin 2>/dev/null; }; then
+        ln -sf "${work_dir}/2go.sh" /usr/local/bin/2go 2>/dev/null || true
+    fi
+    ln -sf "${work_dir}/2go.sh" "${bin_dir}/2go"
+
+    if command -v 2go >/dev/null 2>&1 || [ -x "${bin_dir}/2go" ]; then
+        green "\n快捷指令 2go 创建成功：${bin_dir}/2go"
+        yellow "若当前 shell 找不到 2go，请执行：export PATH=\"${bin_dir}:\$PATH\"\n"
     else
         red "\n快捷指令创建失败\n"
     fi
