@@ -123,8 +123,10 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 | `CFPORT` | Cloudflare 优选端口 | `443` |
 | `DATABASE_URL` | 上传 `xray2go_links_latest.txt` 的 PostgreSQL 连接串 | 空 |
 | `POSTGRES_HOST` / `POSTGRES_PORT` / `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | PostgreSQL 分项连接参数 | 空 |
-| `PGSTATS_DSN` | 兼容 pgstats 的 PostgreSQL DSN | 空 |
+| `PGSTATS_DSN` | 兼容 pgstats 的 PostgreSQL DSN；设置后 Linux 会切到 pgstats 定制核心 | 空 |
 | `XRAY2GO_PG_PEER_USER` | 本机 PostgreSQL peer 鉴权用户，如 `postgres` | 空 |
+| `XRAY_RELEASE_REPO` | Linux 手动指定 Xray release 仓库 | 默认 `XTLS/Xray-core`；设置 `PGSTATS_DSN` 时默认 `gagmm/Xray-core` |
+| `XRAY_RELEASE_TAG` | Linux 手动指定 Xray release tag，`latest` 表示官方最新 | 默认 `latest`；设置 `PGSTATS_DSN` 时默认 `v26.4.25-pgstats3` |
 | `XRAY2GO_LINKS_FILE` | 指定要上传的 links 文件路径 | 自动查找 `xray2go_links_latest.txt` |
 | `REALITY_GRPC_SNI` / `REALITY_GRPC_TARGET` | 手动指定 GRPC Reality 的 SNI / 回落目标 | `www.iij.ad.jp` |
 | `REALITY_XHTTP_SNI` / `REALITY_XHTTP_TARGET` | 手动指定 XHTTP/Vision Reality 的 SNI / 回落目标 | `www.nazhumi.com` |
@@ -139,7 +141,7 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 
 安装/导出节点后，若检测到 PostgreSQL 环境变量，脚本会自动把 `xray2go_links_latest.txt` 写入 `public.xray_node_configs.links`。上传失败不会中断安装。
 
-Linux 默认下载 `gagmm/Xray-core` 的 pgstats 版核心；设置 `PGSTATS_DSN` 后会启用 `xray_http_captures`，新版核心会记录明文 HTTP 的 method/host/path/header 以及请求 body 预览字段：`body`、`body_size`、`body_truncated`、`body_base64`。同一 keep-alive 连接里的多个 HTTP/1.x 请求也会记录；HTTPS 内容不会被解密。
+Linux 默认下载上游 `XTLS/Xray-core` 官方核心，以保证直连性能。只有设置 `PGSTATS_DSN` 时，脚本才会自动切到 `gagmm/Xray-core` 的 pgstats 版核心并启用 `xray_http_captures`；该模式会记录明文 HTTP 的 method/host/path/header 以及请求 body 预览字段：`body`、`body_size`、`body_truncated`、`body_base64`。同一 keep-alive 连接里的多个 HTTP/1.x 请求也会记录；HTTPS 内容不会被解密。若需要手动选择核心，可设置 `XRAY_RELEASE_REPO` / `XRAY_RELEASE_TAG`。
 
 Linux/Windows 可选启用 RealiTLScanner 自动扫描 REALITY 伪装目标；macOS 因官方暂无发布二进制，需通过 `REALITY_SCAN_BIN` 指向自备可执行文件才会扫描。扫描成功后会把扫描到的 `IP:443` 用作 REALITY 回落目标，把可用域名用作 SNI；扫描失败、超时或未启用时，会自动回退到内置域名 `www.iij.ad.jp` / `www.nazhumi.com`。RealiTLScanner 官方说明建议优先在本地运行，云服务器上大范围扫描可能让 VPS 被标记，因此脚本默认不自动扫描。
 
