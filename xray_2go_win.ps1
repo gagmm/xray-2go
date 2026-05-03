@@ -82,12 +82,17 @@ function Assign-Ports {
     while (($script:XHTTP_PORT -eq $script:PORT) -or ($script:XHTTP_PORT -eq $script:ARGO_PORT) -or ($script:XHTTP_PORT -eq $script:GRPC_PORT)) {
         $script:XHTTP_PORT = Find-AvailablePort -StartPort 30001 -EndPort 50000
     }
+    $script:HY2_PORT = Find-AvailablePort -StartPort 35001 -EndPort 40000
+    while (($script:HY2_PORT -eq $script:PORT) -or ($script:HY2_PORT -eq $script:ARGO_PORT) -or ($script:HY2_PORT -eq $script:GRPC_PORT) -or ($script:HY2_PORT -eq $script:XHTTP_PORT)) {
+        $script:HY2_PORT = Find-AvailablePort -StartPort 35001 -EndPort 40000
+    }
 
     Write-Green '端口分配完成：'
     Write-Green "  订阅端口 (PORT):       $($script:PORT)"
     Write-Green "  Argo 端口 (ARGO_PORT): $($script:ARGO_PORT)"
     Write-Green "  GRPC 端口:             $($script:GRPC_PORT)"
     Write-Green "  XHTTP 端口:            $($script:XHTTP_PORT)"
+    Write-Green "  Hysteria2 端口 (UDP):  $($script:HY2_PORT)"
 }
 
 function Save-Ports {
@@ -96,7 +101,9 @@ function Save-Ports {
         "ARGO_PORT=$($script:ARGO_PORT)",
         "GRPC_PORT=$($script:GRPC_PORT)",
         "XHTTP_PORT=$($script:XHTTP_PORT)",
+        "HY2_PORT=$($script:HY2_PORT)",
         "password=$($script:password)",
+        "hy2_password=$($script:hy2Password)",
         "private_key=$($script:privateKey)",
         "public_key=$($script:publicKey)",
         "UUID=$($script:UUID)",
@@ -204,6 +211,20 @@ function ConvertFrom-Base64 {
     param([string]$Text)
     $bytes = [Convert]::FromBase64String($Text)
     return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+function Ensure-Hy2Certificate {
+    $certPrefix = Join-Path $WorkDir 'hy2'
+    $certFile = Join-Path $WorkDir 'hy2.crt'
+    $keyFile = Join-Path $WorkDir 'hy2.key'
+    if ((Test-Path $certFile) -and (Test-Path $keyFile)) { return }
+
+    Write-Yellow '生成 Hysteria2 自签 TLS 证书...'
+    & "$WorkDir\xray.exe" tls cert '-domain=xray2go.local' '-name=xray2go.local' '-org=xray2go' '-expire=87600h' "-file=$certPrefix" | Out-Null
+    if (-not ((Test-Path $certFile) -and (Test-Path $keyFile))) {
+        Write-Red 'Hysteria2 证书生成失败'
+        throw 'HY2 certificate generation failed'
+    }
 }
 
 # ==========================================
@@ -491,6 +512,7 @@ function Install-Xray {
 
     $script:UUID = New-UUID
     $script:password = New-Password
+    $script:hy2Password = New-Password -Length 32
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -545,6 +567,7 @@ function Install-Xray {
     }
     Write-Green '密钥对生成成功'
 
+    Ensure-Hy2Certificate
     Save-Ports
 
     # 防火墙
@@ -555,6 +578,9 @@ function Install-Xray {
         Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p -ErrorAction SilentlyContinue | Out-Null
     }
+    $hy2RuleName = "Xray2go_HY2_$($script:HY2_PORT)"
+    Remove-NetFirewallRule -DisplayName $hy2RuleName -ErrorAction SilentlyContinue
+    New-NetFirewallRule -DisplayName $hy2RuleName -Direction Inbound -Action Allow -Protocol UDP -LocalPort $script:HY2_PORT -ErrorAction SilentlyContinue | Out-Null
     # 内部端口
     foreach ($p in @(3001, 3002, 3003)) {
         $ruleName = "Xray2go_Internal_$p"
@@ -622,6 +648,16 @@ function Install-Xray {
                         privateKey = $script:privateKey; shortIds = @('')
                     }
                     grpcSettings = @{ serviceName = 'grpc' }
+                }
+                sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic') }
+            },
+            @{
+                listen = '::'; port = [int]$script:HY2_PORT; tag = 'in-hysteria2'; protocol = 'hysteria'
+                settings = @{ version = 2; clients = @( @{ auth = $script:hy2Password; level = 0; email = 'xray2go@hy2' } ) }
+                streamSettings = @{
+                    network = 'hysteria'; security = 'tls'
+                    tlsSettings = @{ serverName = 'xray2go.local'; alpn = @('h3'); certificates = @( @{ certificateFile = (Join-Path $WorkDir 'hy2.crt'); keyFile = (Join-Path $WorkDir 'hy2.key') } ) }
+                    hysteriaSettings = @{ version = 2; auth = $script:hy2Password; udpIdleTimeout = 60; masquerade = @{ type = 'string'; content = 'not found'; statusCode = 404 } }
                 }
                 sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic') }
             }
@@ -772,11 +808,13 @@ function Get-Info {
     $vmessBase64 = ConvertTo-Base64 -Text $vmessJson
 
     $urlLines = @(
-        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)??encryption=none&security=reality&sni=$($script:REALITY_GRPC_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=$($script:REALITY_GRPC_SNI)&serviceName=grpc&mode=gun#${isp}",
+        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)?encryption=none&security=reality&sni=$($script:REALITY_GRPC_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=$($script:REALITY_GRPC_SNI)&serviceName=grpc&mode=gun#${isp}-grpc-reality",
         '',
-        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=$($script:REALITY_XHTTP_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}",
+        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=$($script:REALITY_XHTTP_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality",
         '',
-        "vless://$($script:UUID)@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}",
+        "hysteria2://$($script:hy2Password)@${IP}:$($script:HY2_PORT)?insecure=1&sni=xray2go.local#${isp}-hy2",
+        '',
+        "vless://$($script:UUID)@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo",
         '',
         "vmess://${vmessBase64}",
         ''
@@ -828,6 +866,7 @@ function Export-ProxyTxt {
     $urlContent = Get-Content $ClientDir -ErrorAction SilentlyContinue
     $lineGrpc  = $urlContent | Where-Object { $_ -match 'grpc' }  | Select-Object -First 1
     $lineXhttp = $urlContent | Where-Object { $_ -match 'xhttp' } | Select-Object -First 1
+    $lineHy2   = $urlContent | Where-Object { $_ -match '^hysteria2://' } | Select-Object -First 1
     $lineWs    = $urlContent | Where-Object { ($_ -match 'vless') -and ($_ -match 'ws') } | Select-Object -First 1
     $lineVmess = $urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1
 
@@ -845,6 +884,7 @@ function Export-ProxyTxt {
     $lines += "ARGO_PORT:  $($script:ARGO_PORT)"
     $lines += "GRPC_PORT:  $($script:GRPC_PORT)"
     $lines += "XHTTP_PORT: $($script:XHTTP_PORT)"
+    $lines += "HY2_PORT:   $($script:HY2_PORT)/udp"
     $lines += ''
     $lines += "UUID: $($script:UUID)"
     $lines += "Argo Domain: $adStr"
@@ -858,6 +898,9 @@ function Export-ProxyTxt {
     $lines += ''
     $lines += '--- VLESS XHTTP Reality ---'
     $lines += $lineXhttp
+    $lines += ''
+    $lines += '--- Hysteria2 ---'
+    $lines += $lineHy2
     $lines += ''
     $lines += '--- VLESS WS (Argo) ---'
     $lines += $lineWs

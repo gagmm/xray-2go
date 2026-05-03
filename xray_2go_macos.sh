@@ -63,11 +63,16 @@ assign_ports() {
     while [ "$XHTTP_PORT" = "$PORT" ] || [ "$XHTTP_PORT" = "$ARGO_PORT" ] || [ "$XHTTP_PORT" = "$GRPC_PORT" ]; do
         export XHTTP_PORT=$(find_available_port 30001 50000)
     done
+    export HY2_PORT=$(find_available_port 35001 40000)
+    while [ "$HY2_PORT" = "$PORT" ] || [ "$HY2_PORT" = "$ARGO_PORT" ] || [ "$HY2_PORT" = "$GRPC_PORT" ] || [ "$HY2_PORT" = "$XHTTP_PORT" ]; do
+        export HY2_PORT=$(find_available_port 35001 40000)
+    done
     green "端口分配完成："
     green "  订阅端口 (PORT):       $PORT"
     green "  Argo 端口 (ARGO_PORT): $ARGO_PORT"
     green "  GRPC 端口:             $GRPC_PORT"
     green "  XHTTP 端口:            $XHTTP_PORT"
+    green "  Hysteria2 端口 (UDP):  $HY2_PORT"
 }
 
 # 定义环境变量
@@ -439,6 +444,19 @@ install_xray() {
 
     # 生成随机密码
     password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24)
+    hy2_password=$(openssl rand -hex 16 2>/dev/null || LC_ALL=C tr -dc 'a-f0-9' < /dev/urandom | head -c 32)
+
+    # Hysteria2 基于 QUIC/TLS，需要服务端证书；这里生成自签证书，客户端链接使用 insecure=1。
+    if [ ! -s "${work_dir}/hy2.crt" ] || [ ! -s "${work_dir}/hy2.key" ]; then
+        "${work_dir}/xray" tls cert -domain=xray2go.local -name=xray2go.local -org=xray2go -expire=87600h -file="${work_dir}/hy2" >/dev/null 2>&1 || \
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${work_dir}/hy2.key" \
+            -out "${work_dir}/hy2.crt" \
+            -days 3650 \
+            -subj "/CN=xray2go.local" >/dev/null 2>&1
+        chmod 600 "${work_dir}/hy2.key" 2>/dev/null || true
+        chmod 644 "${work_dir}/hy2.crt" 2>/dev/null || true
+    fi
 
     # 生成 x25519 密钥对
     output=$("${work_dir}/xray" x25519 2>&1)
@@ -459,7 +477,9 @@ PORT=$PORT
 ARGO_PORT=$ARGO_PORT
 GRPC_PORT=$GRPC_PORT
 XHTTP_PORT=$XHTTP_PORT
+HY2_PORT=$HY2_PORT
 password=$password
+hy2_password=$hy2_password
 private_key=$private_key
 public_key=$public_key
 UUID=$UUID
@@ -517,6 +537,17 @@ EOF
       "streamSettings":{"network":"grpc", "security":"reality", "realitySettings":{"dest":"${REALITY_GRPC_TARGET}:443", "serverNames":["${REALITY_GRPC_SNI}"],
       "privateKey":"$private_key", "shortIds":[""]}, "grpcSettings":{"serviceName":"grpc"}},
       "sniffing":{"enabled":true, "destOverride":["http","tls","quic"]}
+    },
+    {
+      "listen":"::", "port":$HY2_PORT, "tag":"in-hysteria2", "protocol":"hysteria",
+      "settings":{"version":2,"clients":[{"auth":"$hy2_password","level":0,"email":"xray2go@hy2"}]},
+      "streamSettings":{
+        "network":"hysteria",
+        "security":"tls",
+        "tlsSettings":{"serverName":"xray2go.local","alpn":["h3"],"certificates":[{"certificateFile":"${work_dir}/hy2.crt","keyFile":"${work_dir}/hy2.key"}]},
+        "hysteriaSettings":{"version":2,"auth":"$hy2_password","udpIdleTimeout":60,"masquerade":{"type":"string","content":"not found","statusCode":404}}
+      },
+      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
   ],
   "dns": { "servers": ["https+local://8.8.8.8/dns-query"] },
@@ -671,11 +702,13 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}
+vless://${UUID}@${IP}:${GRPC_PORT}?encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}-grpc-reality
 
-vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}
+vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality
 
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}
+hysteria2://${hy2_password}@${IP}:${HY2_PORT}?insecure=1&sni=xray2go.local#${isp}-hy2
+
+vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo
 
 vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64)
 
@@ -781,6 +814,7 @@ export_proxy_txt() {
   Argo端口:  ${ARGO_PORT}
   GRPC端口:  ${GRPC_PORT}
   XHTTP端口: ${XHTTP_PORT}
+  HY2端口:   ${HY2_PORT}/udp
 
 【UUID】
   ${UUID}
@@ -798,11 +832,14 @@ $(sed -n '1p' "${work_dir}/url.txt")
 --- VLESS XHTTP Reality ---
 $(sed -n '3p' "${work_dir}/url.txt")
 
---- VLESS WS (Argo) ---
+--- Hysteria2 ---
 $(sed -n '5p' "${work_dir}/url.txt")
 
---- VMess WS (Argo) ---
+--- VLESS WS (Argo) ---
 $(sed -n '7p' "${work_dir}/url.txt")
+
+--- VMess WS (Argo) ---
+$(sed -n '9p' "${work_dir}/url.txt")
 
 ============================================
   订阅链接

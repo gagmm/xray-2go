@@ -365,6 +365,26 @@ install_xray() {
     password=$(< /dev/urandom tr -dc 'A-Za-z0-9' | head -c 24)
     # Shadowsocks 2022 (blake3-aes-128-gcm) 需要 16 字节 base64 密钥
     ss_key=$(openssl rand -base64 16 2>/dev/null || head -c 16 /dev/urandom | base64)
+    # Hysteria2 认证密码。Xray 官方配置里 hysteria inbound 的 clients.auth 是任意字符串。
+    hy2_password=$(openssl rand -hex 16 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+    # Hysteria2 基于 QUIC/TLS，需要服务端证书；这里生成自签证书，客户端链接使用 insecure=1。
+    if [ ! -s "${work_dir}/hy2.crt" ] || [ ! -s "${work_dir}/hy2.key" ]; then
+        "${work_dir}/${server_name}" tls cert -domain=xray2go.local -name=xray2go.local -org=xray2go -expire=87600h -file="${work_dir}/hy2" >/dev/null 2>&1 || \
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${work_dir}/hy2.key" \
+            -out "${work_dir}/hy2.crt" \
+            -days 3650 \
+            -subj "/CN=xray2go.local" \
+            -addext "subjectAltName=DNS:xray2go.local" >/dev/null 2>&1 || \
+        openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "${work_dir}/hy2.key" \
+            -out "${work_dir}/hy2.crt" \
+            -days 3650 \
+            -subj "/CN=xray2go.local" >/dev/null 2>&1
+        chmod 600 "${work_dir}/hy2.key" 2>/dev/null || true
+        chmod 644 "${work_dir}/hy2.crt" 2>/dev/null || true
+    fi
 
     # 关闭防火墙
     iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
@@ -386,6 +406,7 @@ SS_PORT=$SS_PORT
 HY2_PORT=$HY2_PORT
 password=$password
 ss_key=$ss_key
+hy2_password=$hy2_password
 private_key=$private_key
 public_key=$public_key
 UUID=$UUID
@@ -452,6 +473,17 @@ cat > "${config_dir}" << EOF
       "listen":"::","port":$SS_PORT,"tag":"in-ss2022","protocol":"shadowsocks",
       "settings":{"method":"2022-blake3-aes-128-gcm","password":"$ss_key","network":"tcp,udp"},
       "streamSettings":{"network":"tcp"},
+      "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
+    },
+    {
+      "listen":"::","port":$HY2_PORT,"tag":"in-hysteria2","protocol":"hysteria",
+      "settings":{"version":2,"clients":[{"auth":"$hy2_password","level":0,"email":"xray2go@hy2"}]},
+      "streamSettings":{
+        "network":"hysteria",
+        "security":"tls",
+        "tlsSettings":{"serverName":"xray2go.local","alpn":["h3"],"certificates":[{"certificateFile":"${work_dir}/hy2.crt","keyFile":"${work_dir}/hy2.key"}]},
+        "hysteriaSettings":{"version":2,"auth":"$hy2_password","udpIdleTimeout":60,"masquerade":{"type":"string","content":"not found","statusCode":404}}
+      },
       "sniffing":{"enabled":true,"destOverride":["http","tls","quic"]}
     }
   ],
@@ -597,13 +629,15 @@ get_info() {
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
     cat > ${work_dir}/url.txt <<EOF
-vless://${UUID}@${IP}:${GRPC_PORT}??encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}-grpc-reality
+vless://${UUID}@${IP}:${GRPC_PORT}?encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}-grpc-reality
 
 vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality
 
 vless://${UUID}@${IP}:${VISION_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=tcp#${isp}-vision-reality
 
 ss://$(echo -n "2022-blake3-aes-128-gcm:${ss_key}" | base64 -w0)@${IP}:${SS_PORT}#${isp}-ss2022
+
+hysteria2://${hy2_password}@${IP}:${HY2_PORT}?insecure=1&sni=xray2go.local#${isp}-hy2
 
 vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo
 
@@ -937,6 +971,9 @@ export_proxy_txt() {
   Argo端口:  ${ARGO_PORT}
   GRPC端口:  ${GRPC_PORT}
   XHTTP端口: ${XHTTP_PORT}
+  Vision端口:${VISION_PORT}
+  SS端口:    ${SS_PORT}
+  HY2端口:   ${HY2_PORT}/udp
 
 【UUID】
   ${UUID}
@@ -954,11 +991,20 @@ $(sed -n '1p' "${work_dir}/url.txt")
 --- VLESS XHTTP Reality ---
 $(sed -n '3p' "${work_dir}/url.txt")
 
---- VLESS WS (Argo) ---
+--- VLESS Vision Reality ---
 $(sed -n '5p' "${work_dir}/url.txt")
 
---- VMess WS (Argo) ---
+--- Shadowsocks 2022 ---
 $(sed -n '7p' "${work_dir}/url.txt")
+
+--- Hysteria2 ---
+$(sed -n '9p' "${work_dir}/url.txt")
+
+--- VLESS WS (Argo) ---
+$(sed -n '11p' "${work_dir}/url.txt")
+
+--- VMess WS (Argo) ---
+$(sed -n '13p' "${work_dir}/url.txt")
 
 ============================================
   订阅链接
