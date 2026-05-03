@@ -358,21 +358,10 @@ install_xray() {
 
     # 下载xray,cloudflared
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
-    # 默认使用上游 XTLS/Xray-core，避免 pgstats 定制核心影响直连吞吐。
-    # 如需 PostgreSQL HTTP 捕获/观测，设置 PGSTATS_DSN 后会自动切到 gagmm/Xray-core pgstats 版；也可用 XRAY_RELEASE_REPO / XRAY_RELEASE_TAG 手动覆盖。
-    if [[ -z "${XRAY_RELEASE_REPO:-}" && -n "${PGSTATS_DSN:-}" ]]; then
-        XRAY_RELEASE_REPO="gagmm/Xray-core"
-        XRAY_RELEASE_TAG="${XRAY_RELEASE_TAG:-v26.4.25-pgstats3}"
-    else
-        XRAY_RELEASE_REPO="${XRAY_RELEASE_REPO:-XTLS/Xray-core}"
-        XRAY_RELEASE_TAG="${XRAY_RELEASE_TAG:-latest}"
-    fi
-    if [[ "${XRAY_RELEASE_TAG}" = "latest" ]]; then
-        xray_zip_url="https://github.com/${XRAY_RELEASE_REPO}/releases/latest/download/Xray-linux-${ARCH_ARG}.zip"
-    else
-        xray_zip_url="https://github.com/${XRAY_RELEASE_REPO}/releases/download/${XRAY_RELEASE_TAG}/Xray-linux-${ARCH_ARG}.zip"
-    fi
-    curl -fSL -o "${work_dir}/${server_name}.zip" "${xray_zip_url}"
+    # 使用 gagmm/Xray-core fork（包含 pgstats 观测插件）。要回退到上游，请把下一行改成 XTLS/Xray-core/releases/latest。
+    XRAY_RELEASE_REPO="${XRAY_RELEASE_REPO:-gagmm/Xray-core}"
+    XRAY_RELEASE_TAG="${XRAY_RELEASE_TAG:-v26.4.25-pgstats3}"
+    curl -sLo "${work_dir}/${server_name}.zip" "https://github.com/${XRAY_RELEASE_REPO}/releases/download/${XRAY_RELEASE_TAG}/Xray-linux-${ARCH_ARG}.zip"
     curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
     curl -sLo "${work_dir}/argo" "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
     unzip "${work_dir}/${server_name}.zip" -d "${work_dir}/" > /dev/null 2>&1 && chmod +x ${work_dir}/${server_name} ${work_dir}/argo ${work_dir}/qrencode
