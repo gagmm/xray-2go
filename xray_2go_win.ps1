@@ -138,6 +138,162 @@ function Load-Ports {
     Set-RealityDefaults
 }
 
+
+
+function Add-PortEnvLines {
+    param([string[]]$Lines)
+    if (-not (Test-Path $WorkDir)) { New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null }
+    Add-Content -Path $PortsEnvFile -Value $Lines -Encoding UTF8
+}
+
+function Test-PrivateOrCgnatIPv4 {
+    param([string]$Ip)
+    if ($Ip -notmatch '^\d+\.\d+\.\d+\.\d+$') { return $true }
+    $parts = $Ip.Split('.') | ForEach-Object { [int]$_ }
+    if ($parts[0] -eq 10) { return $true }
+    if ($parts[0] -eq 127) { return $true }
+    if ($parts[0] -eq 169 -and $parts[1] -eq 254) { return $true }
+    if ($parts[0] -eq 172 -and $parts[1] -ge 16 -and $parts[1] -le 31) { return $true }
+    if ($parts[0] -eq 192 -and $parts[1] -eq 168) { return $true }
+    if ($parts[0] -eq 100 -and $parts[1] -ge 64 -and $parts[1] -le 127) { return $true }
+    return $false
+}
+
+function Get-DefaultIPv4 {
+    try {
+        $route = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop | Sort-Object RouteMetric, InterfaceMetric | Select-Object -First 1
+        if ($route) {
+            $addr = Get-NetIPAddress -AddressFamily IPv4 -InterfaceIndex $route.InterfaceIndex -ErrorAction Stop | Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1
+            if ($addr) { return $addr.IPAddress }
+        }
+    }
+    catch {}
+    return $null
+}
+
+function Test-NatMachine {
+    if ($env:XRAY2GO_FORCE_DIRECT -eq '1') {
+        Write-Yellow '已设置 XRAY2GO_FORCE_DIRECT=1，跳过 NAT 自动 Argo-only 策略。'
+        return $false
+    }
+    $localIp = Get-DefaultIPv4
+    $publicIp = $null
+    try { $publicIp = (Invoke-WebRequest -Uri 'https://api.ipify.org' -TimeoutSec 5 -UseBasicParsing).Content.Trim() } catch {}
+    if (-not $localIp) {
+        Write-Yellow '未检测到默认 IPv4 出口，按 NAT/家宽机器处理。'
+        return $true
+    }
+    if (Test-PrivateOrCgnatIPv4 $localIp) {
+        Write-Yellow "检测到本机出口地址为内网/CGNAT：$localIp，按 NAT/家宽机器处理。"
+        return $true
+    }
+    if ($publicIp -match '^\d+\.\d+\.\d+\.\d+$' -and $publicIp -ne $localIp) {
+        Write-Yellow "检测到公网出口 IP($publicIp) 与本机出口 IP($localIp) 不一致，按 NAT/家宽机器处理。"
+        return $true
+    }
+    return $false
+}
+
+function Apply-NatArgoPolicy {
+    Load-Ports
+    if (Test-NatMachine) {
+        $mode = if ($script:ARGO_MODE) { $script:ARGO_MODE } else { 'quick' }
+        Add-PortEnvLines @("ARGO_MODE=$mode", 'XRAY2GO_ARGO_ONLY=1')
+        $script:ARGO_MODE = $mode
+        $script:XRAY2GO_ARGO_ONLY = '1'
+        Write-Green 'NAT/家宽机器：已自动启用 Argo-only 节点输出。'
+    }
+    else {
+        Write-Green '检测到本机可能具备公网 IPv4 入口：保留直连节点输出。'
+    }
+}
+
+
+function Get-CurrentArgoDomain {
+    Load-Ports
+    if ($script:ARGO_MODE -eq 'fixed' -and $script:ARGO_DOMAIN) { return $script:ARGO_DOMAIN }
+    $argoLog = Join-Path $WorkDir 'argo.log'
+    if (Test-Path $argoLog) { return Get-ArgoDomain -LogFile $argoLog }
+    return $null
+}
+
+function Get-SubscriptionUrl {
+    param(
+        [string]$IP,
+        [string]$Port,
+        [string]$Path,
+        [string]$ArgoDomain = $null
+    )
+    Load-Ports
+    if ($script:XRAY2GO_ARGO_ONLY -eq '1') {
+        if (-not $ArgoDomain) { $ArgoDomain = Get-CurrentArgoDomain }
+        if ($ArgoDomain -and $ArgoDomain -ne 'failed.trycloudflare.com') {
+            return "https://$ArgoDomain/$Path"
+        }
+    }
+    return "http://${IP}:${Port}/${Path}"
+}
+
+function Invoke-CFApi {
+    param([string]$Method, [string]$Path, [object]$Body = $null)
+    $headers = @{ Authorization = "Bearer $($env:CF_API_TOKEN)"; 'Content-Type' = 'application/json' }
+    $uri = "https://api.cloudflare.com/client/v4$Path"
+    if ($null -ne $Body) {
+        $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
+        return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $json -ContentType 'application/json' -TimeoutSec 30
+    }
+    return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -TimeoutSec 30
+}
+
+function Setup-CloudflareFixedTunnel {
+    Load-Ports
+    if (-not $env:CF_API_TOKEN -or -not $env:CF_ACCOUNT_ID -or -not $env:CF_ZONE_ID) {
+        $script:ARGO_MODE = 'quick'
+        return
+    }
+    Write-Yellow '检测到 Cloudflare 环境变量，优先创建/使用固定 Argo Tunnel...'
+    try {
+        $zone = Invoke-CFApi -Method GET -Path "/zones/$($env:CF_ZONE_ID)"
+        $zoneName = $zone.result.name
+        if (-not $zoneName) { throw '无法解析 Zone 域名' }
+        $rnd = -join ((48..57 + 97..122) | Get-Random -Count 10 | ForEach-Object { [char]$_ })
+        $tunnelName = if ($env:XRAY2GO_TUNNEL_NAME) { $env:XRAY2GO_TUNNEL_NAME } else { "x2go-$rnd" }
+        $hostName = if ($env:XRAY2GO_TUNNEL_HOST) { $env:XRAY2GO_TUNNEL_HOST } else { "$tunnelName.$zoneName" }
+        $bytes = New-Object byte[] 32
+        [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+        $secret = [Convert]::ToBase64String($bytes)
+        $created = Invoke-CFApi -Method POST -Path "/accounts/$($env:CF_ACCOUNT_ID)/cfd_tunnel" -Body @{ name = $tunnelName; config_src = 'cloudflare'; tunnel_secret = $secret }
+        $tunnelId = $created.result.id
+        if (-not $tunnelId) { throw 'Cloudflare Tunnel ID 获取失败' }
+        $ingress = @{ config = @{ ingress = @(@{ hostname = $hostName; service = "http://localhost:$($script:PORT)"; originRequest = @{} }, @{ service = 'http_status:404' }) } }
+        Invoke-CFApi -Method PUT -Path "/accounts/$($env:CF_ACCOUNT_ID)/cfd_tunnel/$tunnelId/configurations" -Body $ingress | Out-Null
+        $encodedHost = [uri]::EscapeDataString($hostName)
+        $existing = Invoke-CFApi -Method GET -Path "/zones/$($env:CF_ZONE_ID)/dns_records?type=CNAME&name=$encodedHost"
+        $dnsBody = @{ type = 'CNAME'; name = $hostName; content = "$tunnelId.cfargotunnel.com"; proxied = $true }
+        if ($existing.result -and $existing.result.Count -gt 0) {
+            Invoke-CFApi -Method PUT -Path "/zones/$($env:CF_ZONE_ID)/dns_records/$($existing.result[0].id)" -Body $dnsBody | Out-Null
+        } else {
+            Invoke-CFApi -Method POST -Path "/zones/$($env:CF_ZONE_ID)/dns_records" -Body $dnsBody | Out-Null
+        }
+        $tokenResp = Invoke-CFApi -Method GET -Path "/accounts/$($env:CF_ACCOUNT_ID)/cfd_tunnel/$tunnelId/token"
+        $token = $tokenResp.result
+        if (-not $token) { throw '获取 Tunnel token 失败' }
+        $argoOnly = if ($env:XRAY2GO_ARGO_ONLY) { $env:XRAY2GO_ARGO_ONLY } else { '1' }
+        Add-PortEnvLines @('ARGO_MODE=fixed', "ARGO_DOMAIN=$hostName", "ARGO_TUNNEL_NAME=$tunnelName", "ARGO_TUNNEL_ID=$tunnelId", "ARGO_TUNNEL_TOKEN=$token", "XRAY2GO_ARGO_ONLY=$argoOnly")
+        $script:ARGO_MODE = 'fixed'
+        $script:ARGO_DOMAIN = $hostName
+        $script:ARGO_TUNNEL_NAME = $tunnelName
+        $script:ARGO_TUNNEL_ID = $tunnelId
+        $script:ARGO_TUNNEL_TOKEN = $token
+        $script:XRAY2GO_ARGO_ONLY = $argoOnly
+        Write-Green "固定 Argo Tunnel 已配置：$hostName"
+    }
+    catch {
+        Write-Red "固定 Tunnel 配置失败：$($_.Exception.Message)；回退到临时 Argo Tunnel"
+        $script:ARGO_MODE = 'quick'
+    }
+}
+
 function Get-RealIP {
     [string[]]$apis = @(
         'https://ifconfig.me',
@@ -703,7 +859,12 @@ function Install-Services {
     Write-Yellow '正在创建 Argo Tunnel 服务...'
     & $NssmPath stop cloudflared-tunnel 2>$null
     & $NssmPath remove cloudflared-tunnel confirm 2>$null
-    $argoArgs = "tunnel --url http://localhost:$($script:ARGO_PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
+    if ($script:ARGO_MODE -eq 'fixed' -and $script:ARGO_TUNNEL_TOKEN) {
+        $argoArgs = "tunnel --no-autoupdate run --token $($script:ARGO_TUNNEL_TOKEN)"
+    }
+    else {
+        $argoArgs = "tunnel --url http://localhost:$($script:PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
+    }
     & $NssmPath install cloudflared-tunnel "$WorkDir\argo.exe" $argoArgs
     & $NssmPath set cloudflared-tunnel AppDirectory "$WorkDir"
     & $NssmPath set cloudflared-tunnel DisplayName 'Cloudflare Tunnel'
@@ -731,6 +892,14 @@ function Install-CaddyService {
     $caddyLines += '        try_files /sub.txt'
     $caddyLines += '        file_server browse'
     $caddyLines += '        header Content-Type "text/plain; charset=utf-8"'
+    $caddyLines += '    }'
+    $caddyLines += ''
+    $caddyLines += '    handle /vless-argo* {'
+    $caddyLines += "        reverse_proxy 127.0.0.1:$($script:ARGO_PORT)"
+    $caddyLines += '    }'
+    $caddyLines += ''
+    $caddyLines += '    handle /vmess-argo* {'
+    $caddyLines += "        reverse_proxy 127.0.0.1:$($script:ARGO_PORT)"
     $caddyLines += '    }'
     $caddyLines += ''
     $caddyLines += '    handle {'
@@ -791,24 +960,32 @@ function Get-Info {
 
     # 获取 Argo 域名
     $argodomain = $null
-    $argoLog = "$WorkDir\argo.log"
-    for ($i = 1; $i -le 10; $i++) {
-        Write-Purple "第 $i 次尝试获取 ArgoDomain 中..."
-        $argodomain = Get-ArgoDomain -LogFile $argoLog
-        if ($argodomain) { break }
-        Start-Sleep -Seconds 3
+    if ($script:ARGO_MODE -eq 'fixed' -and $script:ARGO_DOMAIN) {
+        $argodomain = $script:ARGO_DOMAIN
+    }
+    else {
+        $argoLog = "$WorkDir\argo.log"
+        for ($i = 1; $i -le 10; $i++) {
+            Write-Purple "第 $i 次尝试获取 ArgoDomain 中..."
+            $argodomain = Get-ArgoDomain -LogFile $argoLog
+            if ($argodomain) { break }
+            Start-Sleep -Seconds 3
+        }
     }
 
     if (-not $argodomain) {
-        Write-Red '获取 Argo 临时域名失败，请稍后重试'
+        Write-Red '获取 Argo 域名失败，请稍后重试'
         $argodomain = 'failed.trycloudflare.com'
     }
 
     Write-Green "`nArgoDomain: $argodomain`n"
 
+    $argoAdd = if ($env:XRAY2GO_ARGO_ADD) { $env:XRAY2GO_ARGO_ADD } else { $argodomain }
+
     # VMess JSON
+    $vmessPs = if ($script:XRAY2GO_ARGO_ONLY -eq '1') { "${isp}-vmess-argo-fixed" } else { $isp }
     $vmessObj = @{
-        v    = '2'; ps = $isp; add = $CFIP; port = $CFPORT
+        v    = '2'; ps = $vmessPs; add = $argoAdd; port = $CFPORT
         id   = $script:UUID; aid = '0'; scy = 'none'; net = 'ws'
         type = 'none'; host = $argodomain; path = '/vmess-argo?ed=2560'
         tls  = 'tls'; sni = $argodomain; alpn = ''; fp = 'chrome'
@@ -816,18 +993,28 @@ function Get-Info {
     $vmessJson = $vmessObj | ConvertTo-Json -Compress
     $vmessBase64 = ConvertTo-Base64 -Text $vmessJson
 
-    $urlLines = @(
-        "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)?encryption=none&security=reality&sni=$($script:REALITY_GRPC_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=$($script:REALITY_GRPC_SNI)&serviceName=grpc&mode=gun#${isp}-grpc-reality",
-        '',
-        "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=$($script:REALITY_XHTTP_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality",
-        '',
-        "hysteria2://$($script:hy2Password)@${IP}:$($script:HY2_PORT)?insecure=1&sni=xray2go.local#${isp}-hy2",
-        '',
-        "vless://$($script:UUID)@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo",
-        '',
-        "vmess://${vmessBase64}",
-        ''
-    )
+    if ($script:XRAY2GO_ARGO_ONLY -eq '1') {
+        $urlLines = @(
+            "vless://$($script:UUID)@${argoAdd}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo-fixed",
+            '',
+            "vmess://${vmessBase64}",
+            ''
+        )
+    }
+    else {
+        $urlLines = @(
+            "vless://$($script:UUID)@${IP}:$($script:GRPC_PORT)?encryption=none&security=reality&sni=$($script:REALITY_GRPC_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=grpc&authority=$($script:REALITY_GRPC_SNI)&serviceName=grpc&mode=gun#${isp}-grpc-reality",
+            '',
+            "vless://$($script:UUID)@${IP}:$($script:XHTTP_PORT)?encryption=none&security=reality&sni=$($script:REALITY_XHTTP_SNI)&fp=chrome&pbk=$($script:publicKey)&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality",
+            '',
+            "hysteria2://$($script:hy2Password)@${IP}:$($script:HY2_PORT)?insecure=1&sni=xray2go.local#${isp}-hy2",
+            '',
+            "vless://$($script:UUID)@${argoAdd}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo",
+            '',
+            "vmess://${vmessBase64}",
+            ''
+        )
+    }
 
     $urlContent = $urlLines -join "`r`n"
     $urlContent | Out-File -FilePath $ClientDir -Encoding UTF8
@@ -837,8 +1024,9 @@ function Get-Info {
     $subBase64 = ConvertTo-Base64 -Text $urlContent
     $subBase64 | Out-File -FilePath "$WorkDir\sub.txt" -Encoding UTF8 -NoNewline
 
-    Write-Yellow "`n温馨提醒：如果是 NAT 机，reality 端口和订阅端口需使用可用端口范围内的端口`n"
-    Write-Green "节点订阅链接：http://${IP}:$($script:PORT)/$($script:password)"
+    $subLink = Get-SubscriptionUrl -IP $IP -Port $script:PORT -Path $script:password -ArgoDomain $argodomain
+    Write-Yellow "`n温馨提醒：NAT/家宽机器会自动使用 Argo 订阅链接，直连 Caddy 订阅链接不可用。`n"
+    Write-Green "节点订阅链接：$subLink"
     Write-Green "`n订阅链接适用于 V2rayN, NekoBox, Karing, Shadowrocket, Loon, 圈X 等`n"
 
     Export-ProxyTxt -Mode 'auto'
@@ -880,7 +1068,8 @@ function Export-ProxyTxt {
     $lineVmess = $urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1
 
     $adStr = if ($argodomain) { $argodomain } else { 'N/A' }
-    $subLink = "http://${IP}:${subPort}/${subPath}"
+    $argoDomain = Get-CurrentArgoDomain
+    $subLink = Get-SubscriptionUrl -IP $IP -Port $subPort -Path $subPath -ArgoDomain $argoDomain
 
     $lines = @()
     $lines += '============================================'
@@ -1273,7 +1462,8 @@ function Show-Nodes {
         Get-Content $ClientDir | ForEach-Object { Write-Purple $_ }
         $serverIp = Get-RealIP
         $info = Get-CaddyInfo
-        $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
+        $argoDomain = Get-CurrentArgoDomain
+        $subLink = Get-SubscriptionUrl -IP $serverIp -Port $info.Port -Path $info.Path -ArgoDomain $argoDomain
         Write-Host ''
         Write-Green "Subscribe: $subLink"
         Write-Host ''
@@ -1376,7 +1566,8 @@ function Manage-Subscription {
             Restart-CaddySvc
             $serverIp = Get-RealIP
             $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$newPw"
+            $argoDomain = Get-CurrentArgoDomain
+            $subLink = Get-SubscriptionUrl -IP $serverIp -Port $info.Port -Path $newPw -ArgoDomain $argoDomain
             Write-Green "New subscribe link: $subLink"
         }
         '3' {
@@ -1394,7 +1585,8 @@ function Manage-Subscription {
             Restart-CaddySvc
             $serverIp = Get-RealIP
             $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:${newPort}/$($info.Path)"
+            $argoDomain = Get-CurrentArgoDomain
+            $subLink = Get-SubscriptionUrl -IP $serverIp -Port $newPort -Path $info.Path -ArgoDomain $argoDomain
             Write-Green "New subscribe link: $subLink"
         }
         '4' { return }
@@ -1467,7 +1659,7 @@ function Manage-ArgoMenu {
         '4' {
             & $NssmPath stop cloudflared-tunnel 2>$null
             & $NssmPath remove cloudflared-tunnel confirm 2>$null
-            $tmpArgs = "tunnel --url http://localhost:$($script:ARGO_PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
+            $tmpArgs = "tunnel --url http://localhost:$($script:PORT) --no-autoupdate --edge-ip-version auto --protocol http2"
             & $NssmPath install cloudflared-tunnel "$WorkDir\argo.exe" $tmpArgs
             & $NssmPath set cloudflared-tunnel AppDirectory "$WorkDir"
             & $NssmPath set cloudflared-tunnel AppStdout "$WorkDir\argo.log"
@@ -1521,7 +1713,8 @@ function Show-ExportMenu {
             Get-Content $ClientDir | Where-Object { $_.Trim() -ne '' } | ForEach-Object { Write-Purple $_ }
             $serverIp = Get-RealIP
             $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
+            $argoDomain = Get-CurrentArgoDomain
+        $subLink = Get-SubscriptionUrl -IP $serverIp -Port $info.Port -Path $info.Path -ArgoDomain $argoDomain
             Write-Host ''
             Write-Green '========== Subscribe =========='
             Write-Green $subLink
@@ -1531,7 +1724,8 @@ function Show-ExportMenu {
             Load-Ports
             $serverIp = Get-RealIP
             $info = Get-CaddyInfo
-            $subLink = "http://${serverIp}:$($info.Port)/$($info.Path)"
+            $argoDomain = Get-CurrentArgoDomain
+        $subLink = Get-SubscriptionUrl -IP $serverIp -Port $info.Port -Path $info.Path -ArgoDomain $argoDomain
             Set-Clipboard -Value $subLink
             Write-Green "Copied: $subLink"
         }
@@ -1586,6 +1780,8 @@ function Show-Menu {
                     Install-Caddy
                     Install-Jq
                     Install-Xray
+                    Setup-CloudflareFixedTunnel
+                    Apply-NatArgoPolicy
                     Install-Services
                     Start-Sleep -Seconds 3
                     Get-Info

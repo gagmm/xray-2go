@@ -100,6 +100,85 @@ get_arch() {
     esac
 }
 
+# 判断 macOS 是否处在 NAT/家宽环境：本机默认出口 IPv4 为内网/CGNAT，或与外部公网出口 IP 不一致。
+is_private_or_cgnat_ipv4() {
+    local ip="$1" a b
+    IFS=. read -r a b _ _ <<< "$ip"
+    [[ "$a" = "10" ]] && return 0
+    [[ "$a" = "127" ]] && return 0
+    [[ "$a" = "169" && "$b" = "254" ]] && return 0
+    [[ "$a" = "172" && "$b" -ge 16 && "$b" -le 31 ]] && return 0
+    [[ "$a" = "192" && "$b" = "168" ]] && return 0
+    [[ "$a" = "100" && "$b" -ge 64 && "$b" -le 127 ]] && return 0
+    return 1
+}
+
+get_default_ipv4() {
+    route -n get 1.1.1.1 2>/dev/null | awk '/interface:/{iface=$2} END{if(iface) print iface}' | while read -r iface; do ipconfig getifaddr "$iface" 2>/dev/null; done | head -1
+}
+
+detect_nat_machine() {
+    local local_ip public_ip
+    local_ip=$(get_default_ipv4)
+    public_ip=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    if [[ -z "$local_ip" || ! "$local_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        yellow "未检测到默认 IPv4 出口，按 NAT/无公网入口处理。"
+        return 0
+    fi
+    if is_private_or_cgnat_ipv4 "$local_ip"; then
+        yellow "检测到本机出口地址为内网/CGNAT：${local_ip}，按 NAT/家宽机器处理。"
+        return 0
+    fi
+    if [[ "$public_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && "$public_ip" != "$local_ip" ]]; then
+        yellow "检测到公网出口 IP(${public_ip}) 与本机出口 IP(${local_ip}) 不一致，按 NAT/家宽机器处理。"
+        return 0
+    fi
+    return 1
+}
+
+apply_nat_argo_policy() {
+    load_ports
+    if [ "${XRAY2GO_FORCE_DIRECT:-0}" = "1" ]; then
+        yellow "已设置 XRAY2GO_FORCE_DIRECT=1，跳过 NAT 自动 Argo-only 策略。"
+        return 0
+    fi
+    if detect_nat_machine; then
+        {
+            echo "ARGO_MODE=${ARGO_MODE:-quick}"
+            echo "XRAY2GO_ARGO_ONLY=1"
+        } >> "${work_dir}/ports.env"
+        export ARGO_MODE="${ARGO_MODE:-quick}" XRAY2GO_ARGO_ONLY=1
+        green "NAT/家宽机器：已自动启用 Argo-only 节点输出。"
+    else
+        green "检测到本机可能具备公网 IPv4 入口：保留直连节点输出。"
+    fi
+}
+
+get_current_argo_domain() {
+    load_ports
+    if [ "${ARGO_MODE:-quick}" = "fixed" ] && [ -n "${ARGO_DOMAIN:-}" ]; then
+        echo "$ARGO_DOMAIN"
+        return 0
+    fi
+    if [ -f "${work_dir}/argo.log" ]; then
+        sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1
+    fi
+}
+
+build_subscription_url() {
+    local ip="$1" port="$2" path="$3" argo_domain="${4:-}"
+    load_ports
+    if [ "${XRAY2GO_ARGO_ONLY:-0}" = "1" ]; then
+        [ -z "$argo_domain" ] && argo_domain=$(get_current_argo_domain)
+        if [ -n "$argo_domain" ] && [ "$argo_domain" != "获取失败请重试" ]; then
+            printf 'https://%s/%s' "$argo_domain" "$path"
+            return 0
+        fi
+    fi
+    printf 'http://%s:%s/%s' "$ip" "$port" "$path"
+}
+
+
 # 获取真实 IP - 多 API 兜底
 get_realip() {
     local apis=(
@@ -580,6 +659,78 @@ load_ports() {
     export REALITY_XHTTP_TARGET=${REALITY_XHTTP_TARGET:-$REALITY_XHTTP_SNI}
 }
 
+
+# Cloudflare 固定 Tunnel 自动配置：存在 CF_API_TOKEN + CF_ACCOUNT_ID + CF_ZONE_ID 时启用。
+cf_api() {
+    local method="$1" path="$2" body="${3:-}"
+    if [ -n "$body" ]; then
+        curl -fsSL -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          -H "Content-Type: application/json" \
+          --data "$body"
+    else
+        curl -fsSL -X "$method" "https://api.cloudflare.com/client/v4${path}" \
+          -H "Authorization: Bearer ${CF_API_TOKEN}" \
+          -H "Content-Type: application/json"
+    fi
+}
+
+cf_json_string() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
+setup_cloudflare_fixed_tunnel() {
+    load_ports
+    if [ -z "${CF_API_TOKEN:-}" ] || [ -z "${CF_ACCOUNT_ID:-}" ] || [ -z "${CF_ZONE_ID:-}" ]; then
+        ARGO_MODE="quick"
+        return 0
+    fi
+    command -v jq >/dev/null 2>&1 || { red "缺少 jq，无法自动创建 Cloudflare 固定 Tunnel"; return 1; }
+    yellow "检测到 Cloudflare 环境变量，优先创建/使用固定 Argo Tunnel..."
+
+    local zone_json zone_name rnd tunnel_name tunnel_secret create_json tunnel_id token host config_json dns_json existing_dns_id
+    zone_json=$(cf_api GET "/zones/${CF_ZONE_ID}") || { red "读取 Cloudflare Zone 失败"; return 1; }
+    zone_name=$(printf '%s' "$zone_json" | jq -r '.result.name // empty')
+    [ -z "$zone_name" ] && { red "无法解析 Zone 域名"; return 1; }
+
+    rnd=$(LC_ALL=C tr -dc 'a-z0-9' </dev/urandom | head -c 10)
+    tunnel_name="${XRAY2GO_TUNNEL_NAME:-x2go-${rnd}}"
+    host="${XRAY2GO_TUNNEL_HOST:-${tunnel_name}.${zone_name}}"
+    tunnel_secret=$(openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64)
+
+    create_json=$(cf_api POST "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel" \
+      "{\"name\":\"$(cf_json_string "$tunnel_name")\",\"config_src\":\"cloudflare\",\"tunnel_secret\":\"$(cf_json_string "$tunnel_secret")\"}") || { red "创建 Cloudflare Tunnel 失败"; return 1; }
+    tunnel_id=$(printf '%s' "$create_json" | jq -r '.result.id // empty')
+    [ -z "$tunnel_id" ] && { red "Cloudflare Tunnel ID 获取失败"; return 1; }
+
+    config_json=$(cat <<EOF
+{"config":{"ingress":[{"hostname":"$(cf_json_string "$host")","service":"http://localhost:${PORT}","originRequest":{}},{"service":"http_status:404"}]}}
+EOF
+)
+    cf_api PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/configurations" "$config_json" >/dev/null || { red "写入 Cloudflare Tunnel ingress 配置失败"; return 1; }
+
+    existing_dns_id=$(cf_api GET "/zones/${CF_ZONE_ID}/dns_records?type=CNAME&name=${host}" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+    dns_json="{\"type\":\"CNAME\",\"name\":\"$(cf_json_string "$host")\",\"content\":\"${tunnel_id}.cfargotunnel.com\",\"proxied\":true}"
+    if [ -n "$existing_dns_id" ]; then
+        cf_api PUT "/zones/${CF_ZONE_ID}/dns_records/${existing_dns_id}" "$dns_json" >/dev/null || { red "更新 DNS 记录失败"; return 1; }
+    else
+        cf_api POST "/zones/${CF_ZONE_ID}/dns_records" "$dns_json" >/dev/null || { red "创建 DNS 记录失败"; return 1; }
+    fi
+
+    token=$(cf_api GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${tunnel_id}/token" | jq -r '.result // empty') || true
+    [ -z "$token" ] && { red "获取 Tunnel token 失败"; return 1; }
+
+    {
+        echo "ARGO_MODE=fixed"
+        echo "ARGO_DOMAIN=$host"
+        echo "ARGO_TUNNEL_NAME=$tunnel_name"
+        echo "ARGO_TUNNEL_ID=$tunnel_id"
+        echo "ARGO_TUNNEL_TOKEN=$token"
+        echo "XRAY2GO_ARGO_ONLY=${XRAY2GO_ARGO_ONLY:-1}"
+    } >> "${work_dir}/ports.env"
+    chmod 600 "${work_dir}/ports.env" 2>/dev/null || true
+    export ARGO_MODE=fixed ARGO_DOMAIN="$host" ARGO_TUNNEL_NAME="$tunnel_name" ARGO_TUNNEL_ID="$tunnel_id" ARGO_TUNNEL_TOKEN="$token" XRAY2GO_ARGO_ONLY="${XRAY2GO_ARGO_ONLY:-1}"
+    green "固定 Argo Tunnel 已配置：${host}"
+}
+
 # macOS launchd 守护进程
 macos_launchd_services() {
     load_ports
@@ -609,6 +760,26 @@ macos_launchd_services() {
 </plist>
 EOF
 
+    local argo_program_args
+    if [ "${ARGO_MODE:-quick}" = "fixed" ] && [ -n "${ARGO_TUNNEL_TOKEN:-}" ]; then
+        argo_program_args="        <string>${work_dir}/argo</string>
+        <string>tunnel</string>
+        <string>--no-autoupdate</string>
+        <string>run</string>
+        <string>--token</string>
+        <string>${ARGO_TUNNEL_TOKEN}</string>"
+    else
+        argo_program_args="        <string>${work_dir}/argo</string>
+        <string>tunnel</string>
+        <string>--url</string>
+        <string>http://localhost:${PORT}</string>
+        <string>--no-autoupdate</string>
+        <string>--edge-ip-version</string>
+        <string>auto</string>
+        <string>--protocol</string>
+        <string>http2</string>"
+    fi
+
     cat > "${launchd_dir}/com.cloudflare.tunnel.plist" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -618,15 +789,7 @@ EOF
     <string>com.cloudflare.tunnel</string>
     <key>ProgramArguments</key>
     <array>
-        <string>${work_dir}/argo</string>
-        <string>tunnel</string>
-        <string>--url</string>
-        <string>http://localhost:${ARGO_PORT}</string>
-        <string>--no-autoupdate</string>
-        <string>--edge-ip-version</string>
-        <string>auto</string>
-        <string>--protocol</string>
-        <string>http2</string>
+${argo_program_args}
     </array>
     <key>RunAtLoad</key>
     <true/>
@@ -686,7 +849,9 @@ get_info() {
 
     isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || echo "vps")
 
-    if [ -f "${work_dir}/argo.log" ]; then
+    if [ "${ARGO_MODE:-quick}" = "fixed" ] && [ -n "${ARGO_DOMAIN:-}" ]; then
+        argodomain="$ARGO_DOMAIN"
+    elif [ -f "${work_dir}/argo.log" ]; then
         for i in {1..10}; do
             purple "第 $i 次尝试获取 ArgoDomain 中..."
             argodomain=$(sed -n 's|.*https://\([^/]*trycloudflare\.com\).*|\1|p' "${work_dir}/argo.log" | tail -1)
@@ -704,24 +869,34 @@ get_info() {
     fi
 
     if [ -z "$argodomain" ]; then
-        red "获取 Argo 临时域名失败，请稍后重试（菜单4 -> 5重新获取）"
+        red "获取 Argo 域名失败，请稍后重试（菜单4 -> 5重新获取）"
         argodomain="获取失败请重试"
     fi
 
     green "\nArgoDomain：${purple}$argodomain${re}\n"
 
-    cat > ${work_dir}/url.txt <<EOF
+    argo_add="${XRAY2GO_ARGO_ADD:-$argodomain}"
+    if [ "${XRAY2GO_ARGO_ONLY:-0}" = "1" ]; then
+        cat > ${work_dir}/url.txt <<EOF
+vless://${UUID}@${argo_add}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo-fixed
+
+vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}-vmess-argo-fixed\", \"add\": \"${argo_add}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64)
+
+EOF
+    else
+        cat > ${work_dir}/url.txt <<EOF
 vless://${UUID}@${IP}:${GRPC_PORT}?encryption=none&security=reality&sni=${REALITY_GRPC_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=grpc&authority=${REALITY_GRPC_SNI}&serviceName=grpc&mode=gun#${isp}-grpc-reality
 
 vless://${UUID}@${IP}:${XHTTP_PORT}?encryption=none&security=reality&sni=${REALITY_XHTTP_SNI}&fp=chrome&pbk=${public_key}&allowInsecure=1&type=xhttp&mode=auto#${isp}-xhttp-reality
 
 hysteria2://${hy2_password}@${IP}:${HY2_PORT}?insecure=1&sni=xray2go.local#${isp}-hy2
 
-vless://${UUID}@${CFIP}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo
+vless://${UUID}@${argo_add}:${CFPORT}?encryption=none&security=tls&sni=${argodomain}&fp=chrome&type=ws&host=${argodomain}&path=%2Fvless-argo%3Fed%3D2560#${isp}-vless-argo
 
-vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${CFIP}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64)
+vmess://$(echo "{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"${argo_add}\", \"port\": \"${CFPORT}\", \"id\": \"${UUID}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"chrome\"}" | base64)
 
 EOF
+    fi
     echo ""
     while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
 
@@ -729,10 +904,11 @@ EOF
     tr -d '\n' < ${work_dir}/sub_tmp.txt > ${work_dir}/sub.txt
     rm -f ${work_dir}/sub_tmp.txt
 
-    yellow "\n温馨提醒：如果是 NAT 机，reality 端口和订阅端口需使用可用端口范围内的端口\n"
-    green "节点订阅链接：http://$IP:$PORT/$password\n\n订阅链接适用于 V2rayN, Nekbox, karing, Sterisand, Loon, 小火箭, 圈X 等\n"
+    sub_link=$(build_subscription_url "$IP" "$PORT" "$password" "$argodomain")
+    yellow "\n温馨提醒：NAT/家宽机器会自动使用 Argo 订阅链接，直连 Caddy 订阅链接不可用。\n"
+    green "节点订阅链接：$sub_link\n\n订阅链接适用于 V2rayN, Nekbox, karing, Sterisand, Loon, 小火箭, 圈X 等\n"
     green "订阅二维码"
-    ${work_dir}/qrencode "http://$IP:$PORT/$password"
+    ${work_dir}/qrencode "$sub_link"
     echo ""
 
     # 安装完成后自动导出一份到桌面
@@ -761,6 +937,14 @@ add_caddy_conf() {
         try_files /sub.txt
         file_server browse
         header Content-Type "text/plain; charset=utf-8"
+    }
+
+    handle /vless-argo* {
+        reverse_proxy 127.0.0.1:$ARGO_PORT
+    }
+
+    handle /vmess-argo* {
+        reverse_proxy 127.0.0.1:$ARGO_PORT
     }
 
     handle {
@@ -893,7 +1077,8 @@ EXPORTEOF
     grep -v '^$' "${work_dir}/url.txt" > "$links_file"
     echo "" >> "$links_file"
     echo "# 订阅链接" >> "$links_file"
-    echo "http://${IP}:${sub_port}/${sub_path}" >> "$links_file"
+    argo_domain=$(get_current_argo_domain)
+    echo "$(build_subscription_url "$IP" "$sub_port" "$sub_path" "$argo_domain")" >> "$links_file"
 
     cp "$links_file" "$links_file_latest"
 
@@ -1080,7 +1265,8 @@ export_menu() {
             local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
             echo ""
             green "========== 订阅链接 =========="
-            green "http://$server_ip:$s_port/$s_path"
+            argo_domain=$(get_current_argo_domain)
+            green "$(build_subscription_url "$server_ip" "$s_port" "$s_path" "$argo_domain")"
             echo ""
             green "================================"
             ;;
@@ -1089,7 +1275,8 @@ export_menu() {
             local server_ip=$(get_realip)
             local s_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
             local s_path=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
-            local sub_link="http://$server_ip:$s_port/$s_path"
+            local argo_domain=$(get_current_argo_domain)
+            local sub_link=$(build_subscription_url "$server_ip" "$s_port" "$s_path" "$argo_domain")
             echo -n "$sub_link" | pbcopy 2>/dev/null
             if [ $? -eq 0 ]; then
                 green "\n订阅链接已复制到剪贴板：$sub_link\n"
@@ -1584,7 +1771,7 @@ protocol: http2
 
 ingress:
   - hostname: $ArgoDomain
-    service: http://localhost:${ARGO_PORT}
+    service: http://localhost:${PORT}
     originRequest:
       noTLSVerify: true
   - service: http_status:404
@@ -1690,7 +1877,9 @@ check_nodes() {
         sub_port=$(sed -n 's/.*:\([0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null | head -1)
         lujing=$(sed -n 's/.*handle \/\([a-zA-Z0-9]*\).*/\1/p' "${work_dir}/Caddyfile" 2>/dev/null)
         if [ -n "$sub_port" ] && [ -n "$lujing" ]; then
-            green "\n\n节点订阅链接：http://$server_ip:$sub_port/$lujing\n"
+            argo_domain=$(get_current_argo_domain)
+            sub_link=$(build_subscription_url "$server_ip" "$sub_port" "$lujing" "$argo_domain")
+            green "\n\n节点订阅链接：$sub_link\n"
         else
             yellow "\n\n订阅信息获取失败，请检查 Caddy 配置\n"
         fi
@@ -1713,6 +1902,8 @@ install_xray2go_all() {
     install_caddy
     manage_packages install jq qrencode
     install_xray
+    setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，回退到临时 Argo Tunnel"
+    apply_nat_argo_policy
     macos_launchd_services
     sleep 3
     get_info
