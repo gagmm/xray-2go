@@ -1831,6 +1831,24 @@ function Show-Menu {
     }
 }
 
+
+function Refresh-ExistingInstall {
+    if ((Check-Xray) -ne 0) {
+        Write-Red '未检测到已安装的 Xray-2go，无法使用 --skip-install。请先运行 install。'
+        return
+    }
+
+    Write-Yellow '检测到已安装 Xray-2go，跳过二进制/依赖安装，仅刷新服务、Argo、订阅和导出。'
+    Load-Ports
+    Setup-CloudflareFixedTunnel
+    Apply-NatArgoPolicy
+    Install-Services
+    Start-Sleep -Seconds 3
+    Get-Info
+    Install-CaddyService
+    Upload-LinksLatestToPostgres
+}
+
 # 入口
 switch ($args[0]) {
     'install' {
@@ -1839,9 +1857,10 @@ switch ($args[0]) {
             Upload-LinksLatestToPostgres
         }
         else {
-            Install-NSSM; Install-Caddy; Install-Jq; Install-Xray; Install-Services; Start-Sleep -Seconds 3; Get-Info; Install-CaddyService
+            Install-NSSM; Install-Caddy; Install-Jq; Install-Xray; Setup-CloudflareFixedTunnel; Apply-NatArgoPolicy; Install-Services; Start-Sleep -Seconds 3; Get-Info; Install-CaddyService
         }
     }
+    { $_ -in @('--skip-install', 'skip-install', 'refresh-existing', 'apply-existing') } { Refresh-ExistingInstall }
     { $_ -in @('upload-db', 'upload-links') } { Upload-LinksLatestToPostgres }
     default { Show-Menu }
 }

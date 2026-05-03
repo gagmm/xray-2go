@@ -1919,6 +1919,26 @@ install_xray2go_all() {
     create_shortcut
 }
 
+
+refresh_existing_xray2go() {
+    check_xray &>/dev/null; local check_xray_ret=$?
+    if [ $check_xray_ret -ne 0 ]; then
+        red "未检测到已安装的 Xray-2go，无法使用 --skip-install。请先运行 install。"
+        return 1
+    fi
+
+    yellow "检测到已安装 Xray-2go，跳过二进制/依赖安装，仅刷新服务、Argo、订阅和导出。"
+    load_ports
+    setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，继续使用现有/临时 Argo Tunnel"
+    apply_nat_argo_policy
+    macos_launchd_services
+    sleep 3
+    get_info
+    add_caddy_conf
+    create_shortcut
+    xray2go_upload_links_latest_to_postgres || true
+}
+
 # 主菜单
 menu() {
     while true; do
@@ -1970,6 +1990,7 @@ menu() {
 
 case "${1:-menu}" in
     install) install_xray2go_all ;;
+    --skip-install|skip-install|refresh-existing|apply-existing) refresh_existing_xray2go ;;
     upload-db|upload-links) xray2go_upload_links_latest_to_postgres ;;
     menu|*) menu ;;
 esac
