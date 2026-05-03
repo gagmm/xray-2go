@@ -336,6 +336,77 @@ reality_apply_scanner_result() {
     green "REALITY 伪装目标已切换为：target=${ip}:443, sni=${sni}（默认域名仍作为失败回退）"
 }
 
+
+# 启用 Linux BBR + fq 队列优化（幂等、最小侵入）
+optimize_bbr() {
+    if [ "${XRAY2GO_ENABLE_BBR:-1}" = "0" ]; then
+        yellow "已通过 XRAY2GO_ENABLE_BBR=0 跳过 BBR 优化"
+        return 0
+    fi
+
+    if [ -f /proc/user_beancounters ]; then
+        yellow "检测到 OpenVZ/受限容器，可能无法修改内核拥塞控制，跳过 BBR 优化"
+        return 0
+    fi
+
+    if ! command -v sysctl >/dev/null 2>&1; then
+        yellow "系统缺少 sysctl，跳过 BBR 优化"
+        return 0
+    fi
+
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+
+    local available_cc
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if ! echo " ${available_cc} " | grep -qw bbr; then
+        yellow "当前内核暂未提供 BBR：${available_cc:-unknown}，未强行安装第三方内核"
+        yellow "如需更激进的 BBRplus/自定义内核，请先人工审计并单独执行内核脚本。"
+        return 0
+    fi
+
+    local conf_dir="/etc/sysctl.d"
+    local conf_file="${conf_dir}/99-xray2go-bbr.conf"
+    mkdir -p "$conf_dir"
+
+    # 清理旧位置里的同名键，避免 /etc/sysctl.conf 或其它 sysctl.d 文件覆盖本配置。
+    local f
+    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+        [ -f "$f" ] || continue
+        [ "$f" = "$conf_file" ] && continue
+        if grep -Eq '^[[:space:]]*(net\.core\.default_qdisc|net\.ipv4\.tcp_congestion_control)[[:space:]]*=' "$f"; then
+            cp -a "$f" "${f}.xray2go-bbr.bak" 2>/dev/null || true
+            sed -i '/^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=/d; /^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=/d' "$f" 2>/dev/null || true
+        fi
+    done
+
+    cat > "$conf_file" <<'EOF'
+# Managed by xray-2go. Safe baseline for high-latency/high-bandwidth proxy links.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+    chmod 644 "$conf_file" 2>/dev/null || true
+
+    local ok=1
+    sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || ok=0
+    sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || ok=0
+    sysctl -p "$conf_file" >/dev/null 2>&1 || ok=0
+
+    local current_cc current_qdisc loaded
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)
+    loaded=$(lsmod 2>/dev/null | grep -w '^tcp_bbr' || true)
+
+    if [ "$current_cc" = "bbr" ] && [ "$current_qdisc" = "fq" ]; then
+        green "BBR 优化已启用：tcp_congestion_control=${current_cc}, default_qdisc=${current_qdisc}"
+        [ -n "$loaded" ] && green "tcp_bbr 模块已加载"
+        return 0
+    fi
+
+    yellow "BBR 优化已写入 ${conf_file}，但当前生效状态异常：tcp_congestion_control=${current_cc}, default_qdisc=${current_qdisc}"
+    [ "$ok" -eq 0 ] && yellow "部分 sysctl 参数应用失败，可能是内核/容器限制。"
+    return 0
+}
+
 # 下载并安装 xray,cloudflared
 install_xray() {
     clear
@@ -1798,6 +1869,7 @@ trap 'red "已取消操作"; exit' INT
 
 install_xray2go_all() {
     check_xray &>/dev/null; local xray_state=$?
+    optimize_bbr || true
     if [ ${xray_state} -eq 0 ]; then
         yellow "Xray-2go 已经安装！"
         xray2go_upload_links_latest_to_postgres || true
@@ -1856,10 +1928,11 @@ while true; do
    purple "9. ssh综合工具箱"
    purple "10. 安装singbox四合一"
    skyblue "11. 上传 xray2go_links_latest.txt 到 PostgreSQL"
+   skyblue "12. 启用/检查 BBR + fq 优化"
    echo   "==============="
    red    "0. 退出脚本"
    echo   "==========="
-   reading "请输入选择(0-11): " choice
+   reading "请输入选择(0-12): " choice
    echo ""
    case "${choice}" in
         1) install_xray2go_all ;;
@@ -1873,14 +1946,16 @@ while true; do
         9) clear && curl -fsSL https://raw.githubusercontent.com/eooce/ssh_tool/main/ssh_tool.sh -o ssh_tool.sh && chmod +x ssh_tool.sh && ./ssh_tool.sh ;;
         10) clear && bash <(curl -Ls https://raw.githubusercontent.com/eooce/sing-box/main/sing-box.sh) ;;
         11) xray2go_upload_links_latest_to_postgres ;;
+        12) optimize_bbr ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 11" ;;
+        *) red "无效的选项，请输入 0 到 12" ;;
    esac
    read -n 1 -s -r -p $'\033[1;91m按任意键继续...\033[0m'
 done
 }
 case "${1:-menu}" in
     install) install_xray2go_all ;;
+    bbr|optimize-bbr) optimize_bbr ;;
     upload-db|upload-links) xray2go_upload_links_latest_to_postgres ;;
     menu|*) menu ;;
 esac

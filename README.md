@@ -44,6 +44,7 @@
 | 导出代理为 txt | ❌ | ✅（详细版 + 纯链接版） |
 | 端口配置持久化 | ❌ | ✅（ports.env） |
 | 手动输入 IP 兜底 | ❌ | ✅ |
+| Linux BBR + fq 优化 | ❌ | ✅（安装时自动启用，可手动检查） |
 
 ## 支持协议
 
@@ -92,6 +93,11 @@ bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_linux.sh)
 PORT=8888 CFIP=www.visa.com.tw CFPORT=8443 bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_linux.sh)
 ```
 
+**仅启用/检查 BBR + fq：**
+```bash
+bash <(curl -Ls https://github.com/gagmm/xray-2go/raw/main/xray_2go_linux.sh) bbr
+```
+
 ### macOS
 
 ```bash
@@ -132,6 +138,7 @@ irm https://github.com/gagmm/xray-2go/raw/main/xray_2go_win.ps1 -OutFile xray_2g
 | `REALITY_SCAN_ADDR` / `REALITY_SCAN_URL` / `REALITY_SCAN_IN` | RealiTLScanner 的扫描目标（IP/CIDR/域名、抓取 URL、目标列表文件三选一） | 空 |
 | `REALITY_SCAN_BIN` | 手动指定 RealiTLScanner 可执行文件路径（macOS 必需；Linux/Windows 可选） | 自动下载/空 |
 | `REALITY_SCAN_PORT` / `REALITY_SCAN_THREAD` / `REALITY_SCAN_TIMEOUT` / `REALITY_SCAN_MAX_SECONDS` | RealiTLScanner 端口、线程、单目标超时、整体超时 | `443` / `5` / `5` / `180` |
+| `XRAY2GO_ENABLE_BBR` | Linux 安装时自动启用 `net.core.default_qdisc=fq` + `net.ipv4.tcp_congestion_control=bbr`；设为 `0` 可跳过 | `1` |
 
 > 💡 **NAT 小鸡**需带 `PORT` 变量运行，并确保 PORT 之后的 2 个端口可用（GRPC/XHTTP），或安装后通过菜单更改端口。
 
