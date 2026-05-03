@@ -451,9 +451,11 @@ function Get-ArgoDomain {
     if (-not (Test-Path $LogFile)) { return $null }
     $content = Get-Content $LogFile -Raw -ErrorAction SilentlyContinue
     if (-not $content) { return $null }
-    $pattern = 'https://([a-zA-Z0-9][a-zA-Z0-9-]*\.trycloudflare\.com)'
-    if ($content -match $pattern) {
-        return $matches[1]
+    # Keep this regex parser-safe for Windows PowerShell 5.1: avoid single-quoted backslash-heavy literals.
+    $pattern = "https://([A-Za-z0-9][A-Za-z0-9-]*[.]trycloudflare[.]com)"
+    $match = [regex]::Match($content, $pattern)
+    if ($match.Success) {
+        return $match.Groups[1].Value
     }
     return $null
 }
