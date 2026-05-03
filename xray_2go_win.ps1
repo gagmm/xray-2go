@@ -1287,13 +1287,13 @@ function Upload-LinksLatestToPostgres {
         $sql = "SELECT public.xray2go_ingest_links($(ConvertTo-SqlJsonb $payload));"
     }
     else {
-        $sql = @"
-CREATE TABLE IF NOT EXISTS public.xray_node_configs (
- node_id text PRIMARY KEY, hostname text NOT NULL DEFAULT '', public_ip inet, install_dir text NOT NULL DEFAULT '', cdn_host text NOT NULL DEFAULT '', argo_domain text NOT NULL DEFAULT '', sub_url text NOT NULL DEFAULT '', uuid text NOT NULL DEFAULT '', public_key text NOT NULL DEFAULT '', ports jsonb NOT NULL DEFAULT '{}'::jsonb, links jsonb NOT NULL DEFAULT '{}'::jsonb, config_json jsonb NOT NULL DEFAULT '{}'::jsonb, raw_ports_env jsonb NOT NULL DEFAULT '{}'::jsonb, script_version text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());
-INSERT INTO public.xray_node_configs (node_id, hostname, public_ip, install_dir, cdn_host, argo_domain, sub_url, uuid, public_key, ports, links, config_json, raw_ports_env, script_version, created_at, updated_at)
-VALUES ($(Quote-SqlText $nodeId), $(Quote-SqlText $hostname), $publicIpSql, $(Quote-SqlText $WorkDir), $(Quote-SqlText $cdnHost), '', $(Quote-SqlText $subUrl), $(Quote-SqlText $script:UUID), $(Quote-SqlText $script:publicKey), $(ConvertTo-SqlJsonb $ports), $(ConvertTo-SqlJsonb $links), '{}'::jsonb, $(ConvertTo-SqlJsonb $meta), 'links_latest_windows', now(), now())
-ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname, public_ip=EXCLUDED.public_ip, install_dir=EXCLUDED.install_dir, cdn_host=EXCLUDED.cdn_host, sub_url=EXCLUDED.sub_url, uuid=EXCLUDED.uuid, public_key=EXCLUDED.public_key, ports=EXCLUDED.ports, links=EXCLUDED.links, raw_ports_env=EXCLUDED.raw_ports_env, script_version=EXCLUDED.script_version, updated_at=now();
-"@
+        $sqlLines = @()
+        $sqlLines += 'CREATE TABLE IF NOT EXISTS public.xray_node_configs ('
+        $sqlLines += " node_id text PRIMARY KEY, hostname text NOT NULL DEFAULT '', public_ip inet, install_dir text NOT NULL DEFAULT '', cdn_host text NOT NULL DEFAULT '', argo_domain text NOT NULL DEFAULT '', sub_url text NOT NULL DEFAULT '', uuid text NOT NULL DEFAULT '', public_key text NOT NULL DEFAULT '', ports jsonb NOT NULL DEFAULT '{}'::jsonb, links jsonb NOT NULL DEFAULT '{}'::jsonb, config_json jsonb NOT NULL DEFAULT '{}'::jsonb, raw_ports_env jsonb NOT NULL DEFAULT '{}'::jsonb, script_version text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now());"
+        $sqlLines += 'INSERT INTO public.xray_node_configs (node_id, hostname, public_ip, install_dir, cdn_host, argo_domain, sub_url, uuid, public_key, ports, links, config_json, raw_ports_env, script_version, created_at, updated_at)'
+        $sqlLines += "VALUES ($(Quote-SqlText $nodeId), $(Quote-SqlText $hostname), $publicIpSql, $(Quote-SqlText $WorkDir), $(Quote-SqlText $cdnHost), '', $(Quote-SqlText $subUrl), $(Quote-SqlText $script:UUID), $(Quote-SqlText $script:publicKey), $(ConvertTo-SqlJsonb $ports), $(ConvertTo-SqlJsonb $links), '{}'::jsonb, $(ConvertTo-SqlJsonb $meta), 'links_latest_windows', now(), now())"
+        $sqlLines += 'ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname, public_ip=EXCLUDED.public_ip, install_dir=EXCLUDED.install_dir, cdn_host=EXCLUDED.cdn_host, sub_url=EXCLUDED.sub_url, uuid=EXCLUDED.uuid, public_key=EXCLUDED.public_key, ports=EXCLUDED.ports, links=EXCLUDED.links, raw_ports_env=EXCLUDED.raw_ports_env, script_version=EXCLUDED.script_version, updated_at=now();'
+        $sql = $sqlLines -join "`r`n"
     }
     $tmpRoot = [IO.Path]::GetTempPath()
     if ($env:TEMP) { $tmpRoot = $env:TEMP }
