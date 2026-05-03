@@ -386,6 +386,98 @@ build_subscription_url() {
 }
 
 
+firewall_record_file="${work_dir}/firewall-managed.rules"
+
+managed_firewall_ports() {
+    load_ports
+    [ -n "${PORT:-}" ] && echo "${PORT}/tcp"
+    [ -n "${GRPC_PORT:-}" ] && echo "${GRPC_PORT}/tcp"
+    [ -n "${XHTTP_PORT:-}" ] && echo "${XHTTP_PORT}/tcp"
+    [ -n "${VISION_PORT:-}" ] && echo "${VISION_PORT}/tcp"
+    [ -n "${WSREALITY_PORT:-}" ] && echo "${WSREALITY_PORT}/tcp"
+    [ -n "${SS_PORT:-}" ] && echo "${SS_PORT}/tcp"
+    [ -n "${SS_PORT:-}" ] && echo "${SS_PORT}/udp"
+    [ -n "${HY2_PORT:-}" ] && echo "${HY2_PORT}/udp"
+}
+
+open_firewall_port() {
+    local port_proto="$1" port proto
+    port="${port_proto%/*}"
+    proto="${port_proto#*/}"
+    [ -n "$port" ] && [ -n "$proto" ] || return 0
+
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+        ufw allow "${port}/${proto}" comment 'xray2go-managed' >/dev/null 2>&1 || true
+        return 0
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+        return 0
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ "$proto" = "tcp" ]; then
+        iptables -C INPUT -p tcp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1 || \
+            iptables -I INPUT -p tcp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ "$proto" = "udp" ]; then
+        iptables -C INPUT -p udp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1 || \
+            iptables -I INPUT -p udp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1 || true
+    fi
+}
+
+sync_firewall_rules() {
+    mkdir -p "$work_dir"
+    local desired
+    desired=$(managed_firewall_ports | sort -u)
+    if [ -z "$desired" ]; then
+        yellow "没有可同步的防火墙端口，跳过。"
+        return 0
+    fi
+    yellow "同步 xray2go 托管防火墙端口（不会清空系统防火墙）：$(echo "$desired" | tr '\n' ' ')"
+    while IFS= read -r pp; do
+        [ -n "$pp" ] && open_firewall_port "$pp"
+    done <<EOF
+$desired
+EOF
+    printf '%s\n' "$desired" > "$firewall_record_file" 2>/dev/null || true
+}
+
+close_firewall_port() {
+    local port_proto="$1" port proto
+    port="${port_proto%/*}"
+    proto="${port_proto#*/}"
+    [ -n "$port" ] && [ -n "$proto" ] || return 0
+    if command -v ufw >/dev/null 2>&1; then
+        ufw --force delete allow "${port}/${proto}" >/dev/null 2>&1 || true
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
+        firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ "$proto" = "tcp" ]; then
+        while iptables -D INPUT -p tcp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1; do :; done
+    fi
+    if command -v iptables >/dev/null 2>&1 && [ "$proto" = "udp" ]; then
+        while iptables -D INPUT -p udp --dport "$port" -m comment --comment xray2go-managed -j ACCEPT >/dev/null 2>&1; do :; done
+    fi
+}
+
+cleanup_managed_firewall_rules() {
+    [ -f "$firewall_record_file" ] || return 0
+    yellow "清理 xray2go 托管防火墙规则..."
+    while IFS= read -r pp; do
+        [ -n "$pp" ] && close_firewall_port "$pp"
+    done < "$firewall_record_file"
+    rm -f "$firewall_record_file" 2>/dev/null || true
+}
+
+validate_xray_config() {
+    [ -x "${work_dir}/${server_name}" ] || return 0
+    [ -s "$config_dir" ] || return 0
+    "${work_dir}/${server_name}" run -test -c "$config_dir" >/tmp/xray2go-config-test.log 2>&1
+}
+
+
 # 获取ip - 多API兜底
 get_realip() {
     local apis=(
@@ -640,9 +732,8 @@ install_xray() {
         chmod 644 "${work_dir}/hy2.crt" 2>/dev/null || true
     fi
 
-    # 关闭防火墙
-    iptables -F > /dev/null 2>&1 && iptables -P INPUT ACCEPT > /dev/null 2>&1 && iptables -P FORWARD ACCEPT > /dev/null 2>&1 && iptables -P OUTPUT ACCEPT > /dev/null 2>&1
-    command -v ip6tables &> /dev/null && ip6tables -F > /dev/null 2>&1 && ip6tables -P INPUT ACCEPT > /dev/null 2>&1 && ip6tables -P FORWARD ACCEPT > /dev/null 2>&1 && ip6tables -P OUTPUT ACCEPT > /dev/null 2>&1
+    # 仅同步脚本托管端口；不要清空用户系统防火墙规则。
+    sync_firewall_rules || yellow "防火墙端口同步失败，请手动放行订阅/节点端口。"
 
     output=$(/etc/xray/xray x25519)
     private_key=$(echo "${output}" | grep "PrivateKey:" | awk '{print $2}')
@@ -1485,6 +1576,10 @@ fi
 restart_xray() {
 if [ ${check_xray} -eq 0 ]; then
    yellow "\n正在重启 ${server_name} 服务\n"
+    if ! validate_xray_config; then
+        red "config.json 校验失败，已取消重启，避免中断现有服务。详情：/tmp/xray2go-config-test.log\n"
+        return 1
+    fi
     if [ -f /etc/alpine-release ]; then
         rc-service ${server_name} restart
     else
@@ -1648,6 +1743,7 @@ uninstall_xray() {
                 systemctl disable tunnel
                 systemctl daemon-reload || true
             fi
+           cleanup_managed_firewall_rules || true
            rm -rf "${work_dir}" || true
            rm -rf /etc/systemd/system/xray.service /etc/systemd/system/tunnel.service 2>/dev/null
 
@@ -2084,6 +2180,8 @@ install_xray2go_all() {
     install_xray
     setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，回退到临时 Argo Tunnel"
     apply_nat_argo_policy
+    sync_firewall_rules || true
+    validate_xray_config || { red "生成的 Xray 配置校验失败，终止安装。详情：/tmp/xray2go-config-test.log"; return 1; }
 
     if [ -x "$(command -v systemctl)" ]; then
         main_systemd_services
@@ -2115,6 +2213,8 @@ refresh_existing_xray2go() {
     load_ports
     setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，继续使用现有/临时 Argo Tunnel"
     apply_nat_argo_policy
+    sync_firewall_rules || true
+    validate_xray_config || { red "现有 Xray 配置校验失败，已取消刷新服务。详情：/tmp/xray2go-config-test.log"; return 1; }
 
     if [ -x "$(command -v systemctl)" ]; then
         main_systemd_services
