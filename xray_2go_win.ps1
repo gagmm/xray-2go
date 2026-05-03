@@ -447,6 +447,17 @@ function Get-StatusText {
     }
 }
 
+function Test-XrayConfig {
+    if (-not (Test-Path "$WorkDir\xray.exe")) { return $true }
+    if (-not (Test-Path $ConfigDir)) { return $true }
+    $logFile = Join-Path $WorkDir 'xray_config_test.log'
+    $output = & "$WorkDir\xray.exe" run -test -c $ConfigDir 2>&1 | Out-String
+    $output | Out-File -FilePath $logFile -Encoding UTF8
+    if ($LASTEXITCODE -eq 0) { return $true }
+    Write-Red "config.json 校验失败，已取消操作，避免中断现有服务。详情：$logFile"
+    return $false
+}
+
 # ==========================================
 # 提取 Argo 域名
 # ==========================================
@@ -751,10 +762,10 @@ function Install-Xray {
     Ensure-Hy2Certificate
     Save-Ports
 
-    # 防火墙
-    Write-Yellow '配置防火墙规则...'
-    [int[]]$ports = @($script:PORT, $script:ARGO_PORT, $script:GRPC_PORT, $script:XHTTP_PORT)
-    foreach ($p in $ports) {
+    # 防火墙：只管理 xray2go 对外端口，不开放内部 fallback 端口。
+    Write-Yellow '配置 xray2go 托管防火墙规则...'
+    [int[]]$tcpPorts = @($script:PORT, $script:GRPC_PORT, $script:XHTTP_PORT)
+    foreach ($p in $tcpPorts) {
         $ruleName = "Xray2go_Port_$p"
         Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
         New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p -ErrorAction SilentlyContinue | Out-Null
@@ -762,13 +773,7 @@ function Install-Xray {
     $hy2RuleName = "Xray2go_HY2_$($script:HY2_PORT)"
     Remove-NetFirewallRule -DisplayName $hy2RuleName -ErrorAction SilentlyContinue
     New-NetFirewallRule -DisplayName $hy2RuleName -Direction Inbound -Action Allow -Protocol UDP -LocalPort $script:HY2_PORT -ErrorAction SilentlyContinue | Out-Null
-    # 内部端口
-    foreach ($p in @(3001, 3002, 3003)) {
-        $ruleName = "Xray2go_Internal_$p"
-        Remove-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalPort $p -ErrorAction SilentlyContinue | Out-Null
-    }
-    Write-Green '防火墙规则已添加'
+    Write-Green 'xray2go 托管防火墙规则已添加'
 
     # 生成配置
     $configJson = @{
@@ -1339,6 +1344,7 @@ function Restart-XraySvc {
     $s = Check-Xray
     if ($s -eq 0 -or $s -eq 1) {
         Write-Yellow '正在重启 Xray 服务...'
+        if (-not (Test-XrayConfig)) { return }
         & $NssmPath restart xray 2>$null
         Start-Sleep -Seconds 2
         if ((Check-Xray) -eq 0) { Write-Green 'Xray 已重启' } else { Write-Red 'Xray 重启失败' }
@@ -1807,6 +1813,7 @@ function Show-Menu {
                     Install-Xray
                     Setup-CloudflareFixedTunnel
                     Apply-NatArgoPolicy
+                    if (-not (Test-XrayConfig)) { return }
                     Install-Services
                     Start-Sleep -Seconds 3
                     Get-Info
@@ -1842,6 +1849,7 @@ function Refresh-ExistingInstall {
     Load-Ports
     Setup-CloudflareFixedTunnel
     Apply-NatArgoPolicy
+    if (-not (Test-XrayConfig)) { return }
     Install-Services
     Start-Sleep -Seconds 3
     Get-Info
@@ -1857,7 +1865,7 @@ switch ($args[0]) {
             Upload-LinksLatestToPostgres
         }
         else {
-            Install-NSSM; Install-Caddy; Install-Jq; Install-Xray; Setup-CloudflareFixedTunnel; Apply-NatArgoPolicy; Install-Services; Start-Sleep -Seconds 3; Get-Info; Install-CaddyService
+            Install-NSSM; Install-Caddy; Install-Jq; Install-Xray; Setup-CloudflareFixedTunnel; Apply-NatArgoPolicy; if (-not (Test-XrayConfig)) { return }; Install-Services; Start-Sleep -Seconds 3; Get-Info; Install-CaddyService
         }
     }
     { $_ -in @('--skip-install', 'skip-install', 'refresh-existing', 'apply-existing') } { Refresh-ExistingInstall }

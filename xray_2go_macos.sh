@@ -180,6 +180,12 @@ build_subscription_url() {
 }
 
 
+validate_xray_config() {
+    [ -x "${work_dir}/${server_name}" ] || return 0
+    [ -s "${config_dir}" ] || return 0
+    "${work_dir}/${server_name}" run -test -c "${config_dir}" > /tmp/xray2go-config-test.log 2>&1
+}
+
 # 获取真实 IP - 多 API 兜底
 get_realip() {
     local apis=(
@@ -1333,6 +1339,10 @@ restart_xray() {
     local status=$?
     if [ $status -eq 0 ] || [ $status -eq 1 ]; then
         yellow "\n正在重启 ${server_name} 服务\n"
+        if ! validate_xray_config; then
+            red "config.json 校验失败，已取消重启，避免中断现有服务。详情：/tmp/xray2go-config-test.log\n"
+            return 1
+        fi
         launchctl unload "${launchd_dir}/com.xray.service.plist" 2>/dev/null
         sleep 1
         launchctl load -w "${launchd_dir}/com.xray.service.plist"
@@ -1912,6 +1922,7 @@ install_xray2go_all() {
     install_xray
     setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，回退到临时 Argo Tunnel"
     apply_nat_argo_policy
+    validate_xray_config || { red "生成的 Xray 配置校验失败，终止安装。详情：/tmp/xray2go-config-test.log"; return 1; }
     macos_launchd_services
     sleep 3
     get_info
@@ -1931,6 +1942,7 @@ refresh_existing_xray2go() {
     load_ports
     setup_cloudflare_fixed_tunnel || yellow "固定 Tunnel 配置失败，继续使用现有/临时 Argo Tunnel"
     apply_nat_argo_policy
+    validate_xray_config || { red "现有 Xray 配置校验失败，已取消刷新服务。详情：/tmp/xray2go-config-test.log"; return 1; }
     macos_launchd_services
     sleep 3
     get_info
