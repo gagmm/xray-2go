@@ -55,8 +55,11 @@ assign_ports() {
     while [ "$ARGO_PORT" = "$PORT" ]; do
         export ARGO_PORT=$(find_available_port 8000 9000)
     done
+    export FB_TCP_PORT=$(find_available_port 31001 32000)
+    export FB_VLESS_WS_PORT=$(find_available_port 32001 33000)
+    export FB_VMESS_WS_PORT=$(find_available_port 33001 34000)
     export GRPC_PORT=$(find_available_port 10000 30000)
-    while [ "$GRPC_PORT" = "$PORT" ] || [ "$GRPC_PORT" = "$ARGO_PORT" ]; do
+    while [ "$GRPC_PORT" = "$PORT" ] || [ "$GRPC_PORT" = "$ARGO_PORT" ] || [ "$GRPC_PORT" = "$FB_TCP_PORT" ] || [ "$GRPC_PORT" = "$FB_VLESS_WS_PORT" ] || [ "$GRPC_PORT" = "$FB_VMESS_WS_PORT" ]; do
         export GRPC_PORT=$(find_available_port 10000 30000)
     done
     export XHTTP_PORT=$(find_available_port 30001 50000)
@@ -70,6 +73,9 @@ assign_ports() {
     green "端口分配完成："
     green "  订阅端口 (PORT):       $PORT"
     green "  Argo 端口 (ARGO_PORT): $ARGO_PORT"
+    green "  Argo 内部 TCP 回落端口: $FB_TCP_PORT"
+    green "  Argo 内部 VLESS-WS 端口:$FB_VLESS_WS_PORT"
+    green "  Argo 内部 VMess-WS 端口:$FB_VMESS_WS_PORT"
     green "  GRPC 端口:             $GRPC_PORT"
     green "  XHTTP 端口:            $XHTTP_PORT"
     green "  Hysteria2 端口 (UDP):  $HY2_PORT"
@@ -475,6 +481,9 @@ install_xray() {
     cat > "${work_dir}/ports.env" << EOF
 PORT=$PORT
 ARGO_PORT=$ARGO_PORT
+FB_TCP_PORT=$FB_TCP_PORT
+FB_VLESS_WS_PORT=$FB_VLESS_WS_PORT
+FB_VMESS_WS_PORT=$FB_VMESS_WS_PORT
 GRPC_PORT=$GRPC_PORT
 XHTTP_PORT=$XHTTP_PORT
 HY2_PORT=$HY2_PORT
@@ -501,25 +510,25 @@ EOF
         "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
         "decryption": "none",
         "fallbacks": [
-          { "dest": 3001 }, { "path": "/vless-argo", "dest": 3002 },
-          { "path": "/vmess-argo", "dest": 3003 }
+          { "dest": $FB_TCP_PORT }, { "path": "/vless-argo", "dest": $FB_VLESS_WS_PORT },
+          { "path": "/vmess-argo", "dest": $FB_VMESS_WS_PORT }
         ]
       },
       "streamSettings": { "network": "tcp" }
     },
     {
-      "port": 3001, "listen": "127.0.0.1", "protocol": "vless",
+      "port": $FB_TCP_PORT, "listen": "127.0.0.1", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
       "streamSettings": { "network": "tcp", "security": "none" }
     },
     {
-      "port": 3002, "listen": "127.0.0.1", "protocol": "vless",
+      "port": $FB_VLESS_WS_PORT, "listen": "127.0.0.1", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID", "level": 0 }], "decryption": "none" },
       "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
     },
     {
-      "port": 3003, "listen": "127.0.0.1", "protocol": "vmess",
+      "port": $FB_VMESS_WS_PORT, "listen": "127.0.0.1", "protocol": "vmess",
       "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }

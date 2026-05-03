@@ -74,8 +74,11 @@ function Assign-Ports {
     while ($script:ARGO_PORT -eq $script:PORT) {
         $script:ARGO_PORT = Find-AvailablePort -StartPort 8000 -EndPort 9000
     }
+    $script:FB_TCP_PORT = Find-AvailablePort -StartPort 31001 -EndPort 32000
+    $script:FB_VLESS_WS_PORT = Find-AvailablePort -StartPort 32001 -EndPort 33000
+    $script:FB_VMESS_WS_PORT = Find-AvailablePort -StartPort 33001 -EndPort 34000
     $script:GRPC_PORT = Find-AvailablePort -StartPort 10000 -EndPort 30000
-    while (($script:GRPC_PORT -eq $script:PORT) -or ($script:GRPC_PORT -eq $script:ARGO_PORT)) {
+    while (($script:GRPC_PORT -eq $script:PORT) -or ($script:GRPC_PORT -eq $script:ARGO_PORT) -or ($script:GRPC_PORT -eq $script:FB_TCP_PORT) -or ($script:GRPC_PORT -eq $script:FB_VLESS_WS_PORT) -or ($script:GRPC_PORT -eq $script:FB_VMESS_WS_PORT)) {
         $script:GRPC_PORT = Find-AvailablePort -StartPort 10000 -EndPort 30000
     }
     $script:XHTTP_PORT = Find-AvailablePort -StartPort 30001 -EndPort 50000
@@ -90,6 +93,9 @@ function Assign-Ports {
     Write-Green '端口分配完成：'
     Write-Green "  订阅端口 (PORT):       $($script:PORT)"
     Write-Green "  Argo 端口 (ARGO_PORT): $($script:ARGO_PORT)"
+    Write-Green "  Argo 内部 TCP 回落端口: $($script:FB_TCP_PORT)"
+    Write-Green "  Argo 内部 VLESS-WS 端口:$($script:FB_VLESS_WS_PORT)"
+    Write-Green "  Argo 内部 VMess-WS 端口:$($script:FB_VMESS_WS_PORT)"
     Write-Green "  GRPC 端口:             $($script:GRPC_PORT)"
     Write-Green "  XHTTP 端口:            $($script:XHTTP_PORT)"
     Write-Green "  Hysteria2 端口 (UDP):  $($script:HY2_PORT)"
@@ -99,6 +105,9 @@ function Save-Ports {
     $content = @(
         "PORT=$($script:PORT)",
         "ARGO_PORT=$($script:ARGO_PORT)",
+        "FB_TCP_PORT=$($script:FB_TCP_PORT)",
+        "FB_VLESS_WS_PORT=$($script:FB_VLESS_WS_PORT)",
+        "FB_VMESS_WS_PORT=$($script:FB_VMESS_WS_PORT)",
         "GRPC_PORT=$($script:GRPC_PORT)",
         "XHTTP_PORT=$($script:XHTTP_PORT)",
         "HY2_PORT=$($script:HY2_PORT)",
@@ -600,26 +609,26 @@ function Install-Xray {
                     clients = @( @{ id = $script:UUID; flow = 'xtls-rprx-vision' } )
                     decryption = 'none'
                     fallbacks = @(
-                        @{ dest = 3001 },
-                        @{ path = '/vless-argo'; dest = 3002 },
-                        @{ path = '/vmess-argo'; dest = 3003 }
+                        @{ dest = [int]$script:FB_TCP_PORT },
+                        @{ path = '/vless-argo'; dest = [int]$script:FB_VLESS_WS_PORT },
+                        @{ path = '/vmess-argo'; dest = [int]$script:FB_VMESS_WS_PORT }
                     )
                 }
                 streamSettings = @{ network = 'tcp' }
             },
             @{
-                port = 3001; listen = '127.0.0.1'; protocol = 'vless'
+                port = [int]$script:FB_TCP_PORT; listen = '127.0.0.1'; protocol = 'vless'
                 settings = @{ clients = @( @{ id = $script:UUID } ); decryption = 'none' }
                 streamSettings = @{ network = 'tcp'; security = 'none' }
             },
             @{
-                port = 3002; listen = '127.0.0.1'; protocol = 'vless'
+                port = [int]$script:FB_VLESS_WS_PORT; listen = '127.0.0.1'; protocol = 'vless'
                 settings = @{ clients = @( @{ id = $script:UUID; level = 0 } ); decryption = 'none' }
                 streamSettings = @{ network = 'ws'; security = 'none'; wsSettings = @{ path = '/vless-argo' } }
                 sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic'); metadataOnly = $false }
             },
             @{
-                port = 3003; listen = '127.0.0.1'; protocol = 'vmess'
+                port = [int]$script:FB_VMESS_WS_PORT; listen = '127.0.0.1'; protocol = 'vmess'
                 settings = @{ clients = @( @{ id = $script:UUID; alterId = 0 } ) }
                 streamSettings = @{ network = 'ws'; wsSettings = @{ path = '/vmess-argo' } }
                 sniffing = @{ enabled = $true; destOverride = @('http', 'tls', 'quic'); metadataOnly = $false }

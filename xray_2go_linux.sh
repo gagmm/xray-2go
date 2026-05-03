@@ -76,6 +76,9 @@ assign_ports() {
     }
     _alloc_port 1000  60000 PORT
     _alloc_port 8000  9000  ARGO_PORT
+    _alloc_port 31001 32000 FB_TCP_PORT       # Argo fallback internal tcp
+    _alloc_port 32001 33000 FB_VLESS_WS_PORT  # Argo fallback internal vless ws
+    _alloc_port 33001 34000 FB_VMESS_WS_PORT  # Argo fallback internal vmess ws
     _alloc_port 10000 15000 GRPC_PORT
     _alloc_port 15001 20000 XHTTP_PORT
     _alloc_port 20001 25000 VISION_PORT       # 新增：vless+vision+reality (tcp)
@@ -85,6 +88,9 @@ assign_ports() {
     green "端口分配完成："
     green "  订阅端口 (PORT):            $PORT"
     green "  Argo 端口 (ARGO_PORT):      $ARGO_PORT"
+    green "  Argo 内部 TCP 回落端口:    $FB_TCP_PORT"
+    green "  Argo 内部 VLESS-WS 端口:   $FB_VLESS_WS_PORT"
+    green "  Argo 内部 VMess-WS 端口:   $FB_VMESS_WS_PORT"
     green "  GRPC-Reality 端口:         $GRPC_PORT"
     green "  XHTTP-Reality 端口:        $XHTTP_PORT"
     green "  Vision-Reality 端口:       $VISION_PORT"
@@ -398,6 +404,9 @@ install_xray() {
     cat > "${work_dir}/ports.env" << EOF
 PORT=$PORT
 ARGO_PORT=$ARGO_PORT
+FB_TCP_PORT=$FB_TCP_PORT
+FB_VLESS_WS_PORT=$FB_VLESS_WS_PORT
+FB_VMESS_WS_PORT=$FB_VMESS_WS_PORT
 GRPC_PORT=$GRPC_PORT
 XHTTP_PORT=$XHTTP_PORT
 VISION_PORT=$VISION_PORT
@@ -429,25 +438,25 @@ cat > "${config_dir}" << EOF
         "clients": [{ "id": "$UUID", "flow": "xtls-rprx-vision" }],
         "decryption": "none",
         "fallbacks": [
-          { "dest": 3001 }, { "path": "/vless-argo", "dest": 3002 },
-          { "path": "/vmess-argo", "dest": 3003 }
+          { "dest": $FB_TCP_PORT }, { "path": "/vless-argo", "dest": $FB_VLESS_WS_PORT },
+          { "path": "/vmess-argo", "dest": $FB_VMESS_WS_PORT }
         ]
       },
       "streamSettings": { "network": "tcp" }
     },
     {
-      "port": 3001, "listen": "127.0.0.1", "tag": "in-argo-fb-tcp", "protocol": "vless",
+      "port": $FB_TCP_PORT, "listen": "127.0.0.1", "tag": "in-argo-fb-tcp", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID" }], "decryption": "none" },
       "streamSettings": { "network": "tcp", "security": "none" }
     },
     {
-      "port": 3002, "listen": "127.0.0.1", "tag": "in-argo-vless-ws", "protocol": "vless",
+      "port": $FB_VLESS_WS_PORT, "listen": "127.0.0.1", "tag": "in-argo-vless-ws", "protocol": "vless",
       "settings": { "clients": [{ "id": "$UUID", "level": 0 }], "decryption": "none" },
       "streamSettings": { "network": "ws", "security": "none", "wsSettings": { "path": "/vless-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
     },
     {
-      "port": 3003, "listen": "127.0.0.1", "tag": "in-argo-vmess-ws", "protocol": "vmess",
+      "port": $FB_VMESS_WS_PORT, "listen": "127.0.0.1", "tag": "in-argo-vmess-ws", "protocol": "vmess",
       "settings": { "clients": [{ "id": "$UUID", "alterId": 0 }] },
       "streamSettings": { "network": "ws", "wsSettings": { "path": "/vmess-argo" } },
       "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"], "metadataOnly": false }
