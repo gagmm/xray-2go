@@ -19,10 +19,10 @@ $PortsEnvFile = "$WorkDir\ports.env"
 $NssmPath = "$WorkDir\nssm.exe"
 $CFIP = 'cdns.doon.eu.org'
 $CFPORT = '443'
-$script:REALITY_GRPC_SNI = if ($env:REALITY_GRPC_SNI) { $env:REALITY_GRPC_SNI } else { 'www.iij.ad.jp' }
-$script:REALITY_GRPC_TARGET = if ($env:REALITY_GRPC_TARGET) { $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_SNI }
-$script:REALITY_XHTTP_SNI = if ($env:REALITY_XHTTP_SNI) { $env:REALITY_XHTTP_SNI } else { 'www.nazhumi.com' }
-$script:REALITY_XHTTP_TARGET = if ($env:REALITY_XHTTP_TARGET) { $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_SNI }
+if ($env:REALITY_GRPC_SNI) { $script:REALITY_GRPC_SNI = $env:REALITY_GRPC_SNI } else { $script:REALITY_GRPC_SNI = 'www.iij.ad.jp' }
+if ($env:REALITY_GRPC_TARGET) { $script:REALITY_GRPC_TARGET = $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_TARGET = $script:REALITY_GRPC_SNI }
+if ($env:REALITY_XHTTP_SNI) { $script:REALITY_XHTTP_SNI = $env:REALITY_XHTTP_SNI } else { $script:REALITY_XHTTP_SNI = 'www.nazhumi.com' }
+if ($env:REALITY_XHTTP_TARGET) { $script:REALITY_XHTTP_TARGET = $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_TARGET = $script:REALITY_XHTTP_SNI }
 
 # ==========================================
 # 颜色输出
@@ -38,16 +38,16 @@ function Write-SkyBlue { param([string]$Text); Write-Host $Text -ForegroundColor
 # ==========================================
 function Set-RealityDefaults {
     if (-not $script:REALITY_GRPC_SNI) {
-        $script:REALITY_GRPC_SNI = if ($env:REALITY_GRPC_SNI) { $env:REALITY_GRPC_SNI } else { 'www.iij.ad.jp' }
+        if ($env:REALITY_GRPC_SNI) { $script:REALITY_GRPC_SNI = $env:REALITY_GRPC_SNI } else { $script:REALITY_GRPC_SNI = 'www.iij.ad.jp' }
     }
     if (-not $script:REALITY_GRPC_TARGET) {
-        $script:REALITY_GRPC_TARGET = if ($env:REALITY_GRPC_TARGET) { $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_SNI }
+        if ($env:REALITY_GRPC_TARGET) { $script:REALITY_GRPC_TARGET = $env:REALITY_GRPC_TARGET } else { $script:REALITY_GRPC_TARGET = $script:REALITY_GRPC_SNI }
     }
     if (-not $script:REALITY_XHTTP_SNI) {
-        $script:REALITY_XHTTP_SNI = if ($env:REALITY_XHTTP_SNI) { $env:REALITY_XHTTP_SNI } else { 'www.nazhumi.com' }
+        if ($env:REALITY_XHTTP_SNI) { $script:REALITY_XHTTP_SNI = $env:REALITY_XHTTP_SNI } else { $script:REALITY_XHTTP_SNI = 'www.nazhumi.com' }
     }
     if (-not $script:REALITY_XHTTP_TARGET) {
-        $script:REALITY_XHTTP_TARGET = if ($env:REALITY_XHTTP_TARGET) { $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_SNI }
+        if ($env:REALITY_XHTTP_TARGET) { $script:REALITY_XHTTP_TARGET = $env:REALITY_XHTTP_TARGET } else { $script:REALITY_XHTTP_TARGET = $script:REALITY_XHTTP_SNI }
     }
 }
 
@@ -197,7 +197,8 @@ function Test-NatMachine {
 function Apply-NatArgoPolicy {
     Load-Ports
     if (Test-NatMachine) {
-        $mode = if ($script:ARGO_MODE) { $script:ARGO_MODE } else { 'quick' }
+        $mode = 'quick'
+        if ($script:ARGO_MODE) { $mode = $script:ARGO_MODE }
         Add-PortEnvLines @("ARGO_MODE=$mode", 'XRAY2GO_ARGO_ONLY=1')
         $script:ARGO_MODE = $mode
         $script:XRAY2GO_ARGO_ONLY = '1'
@@ -239,7 +240,7 @@ function Invoke-CFApi {
     $headers = @{ Authorization = "Bearer $($env:CF_API_TOKEN)"; 'Content-Type' = 'application/json' }
     $uri = "https://api.cloudflare.com/client/v4$Path"
     if ($null -ne $Body) {
-        $json = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
+        if ($Body -is [string]) { $json = $Body } else { $json = $Body | ConvertTo-Json -Depth 20 -Compress }
         return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -Body $json -ContentType 'application/json' -TimeoutSec 30
     }
     return Invoke-RestMethod -Method $Method -Uri $uri -Headers $headers -ContentType 'application/json' -TimeoutSec 30
@@ -257,8 +258,10 @@ function Setup-CloudflareFixedTunnel {
         $zoneName = $zone.result.name
         if (-not $zoneName) { throw '无法解析 Zone 域名' }
         $rnd = -join ((48..57 + 97..122) | Get-Random -Count 10 | ForEach-Object { [char]$_ })
-        $tunnelName = if ($env:XRAY2GO_TUNNEL_NAME) { $env:XRAY2GO_TUNNEL_NAME } else { "x2go-$rnd" }
-        $hostName = if ($env:XRAY2GO_TUNNEL_HOST) { $env:XRAY2GO_TUNNEL_HOST } else { "$tunnelName.$zoneName" }
+        $tunnelName = "x2go-$rnd"
+        if ($env:XRAY2GO_TUNNEL_NAME) { $tunnelName = $env:XRAY2GO_TUNNEL_NAME }
+        $hostName = "$tunnelName.$zoneName"
+        if ($env:XRAY2GO_TUNNEL_HOST) { $hostName = $env:XRAY2GO_TUNNEL_HOST }
         $bytes = New-Object byte[] 32
         [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
         $secret = [Convert]::ToBase64String($bytes)
@@ -278,7 +281,8 @@ function Setup-CloudflareFixedTunnel {
         $tokenResp = Invoke-CFApi -Method GET -Path "/accounts/$($env:CF_ACCOUNT_ID)/cfd_tunnel/$tunnelId/token"
         $token = $tokenResp.result
         if (-not $token) { throw '获取 Tunnel token 失败' }
-        $argoOnly = if ($env:XRAY2GO_ARGO_ONLY) { $env:XRAY2GO_ARGO_ONLY } else { '1' }
+        $argoOnly = '1'
+        if ($env:XRAY2GO_ARGO_ONLY) { $argoOnly = $env:XRAY2GO_ARGO_ONLY }
         Add-PortEnvLines @('ARGO_MODE=fixed', "ARGO_DOMAIN=$hostName", "ARGO_TUNNEL_NAME=$tunnelName", "ARGO_TUNNEL_ID=$tunnelId", "ARGO_TUNNEL_TOKEN=$token", "XRAY2GO_ARGO_ONLY=$argoOnly")
         $script:ARGO_MODE = 'fixed'
         $script:ARGO_DOMAIN = $hostName
@@ -566,7 +570,8 @@ function Apply-RealityScannerResult {
         New-Item -ItemType Directory -Path $WorkDir -Force | Out-Null
     }
 
-    $scanner = if ($env:REALITY_SCAN_BIN) { $env:REALITY_SCAN_BIN } else { Join-Path $WorkDir 'RealiTLScanner.exe' }
+    $scanner = Join-Path $WorkDir 'RealiTLScanner.exe'
+    if ($env:REALITY_SCAN_BIN) { $scanner = $env:REALITY_SCAN_BIN }
     if (-not (Test-Path $scanner)) {
         if ($ArchInfo.ARCH_ARG -ne '64') {
             Write-Yellow "RealiTLScanner 当前脚本仅自动下载 windows-64 版本，当前架构 $($ArchInfo.ARCH_ARG) 不支持，保留默认 REALITY 域名。"
@@ -583,8 +588,10 @@ function Apply-RealityScannerResult {
         }
     }
 
-    $out = if ($env:REALITY_SCAN_OUT) { $env:REALITY_SCAN_OUT } else { Join-Path $env:TEMP 'realitlscanner-out.csv' }
-    $log = if ($env:REALITY_SCAN_LOG) { $env:REALITY_SCAN_LOG } else { Join-Path $env:TEMP 'realitlscanner.log' }
+    $out = Join-Path $env:TEMP 'realitlscanner-out.csv'
+    if ($env:REALITY_SCAN_OUT) { $out = $env:REALITY_SCAN_OUT }
+    $log = Join-Path $env:TEMP 'realitlscanner.log'
+    if ($env:REALITY_SCAN_LOG) { $log = $env:REALITY_SCAN_LOG }
     $errLog = "$log.err"
     $scanArgs = @()
     if ($env:REALITY_SCAN_IN) {
@@ -601,10 +608,16 @@ function Apply-RealityScannerResult {
         return
     }
 
+    $scanPort = '443'
+    if ($env:REALITY_SCAN_PORT) { $scanPort = $env:REALITY_SCAN_PORT }
+    $scanThread = '5'
+    if ($env:REALITY_SCAN_THREAD) { $scanThread = $env:REALITY_SCAN_THREAD }
+    $scanTimeout = '5'
+    if ($env:REALITY_SCAN_TIMEOUT) { $scanTimeout = $env:REALITY_SCAN_TIMEOUT }
     $scanArgs += @(
-        '-port', (if ($env:REALITY_SCAN_PORT) { $env:REALITY_SCAN_PORT } else { '443' }),
-        '-thread', (if ($env:REALITY_SCAN_THREAD) { $env:REALITY_SCAN_THREAD } else { '5' }),
-        '-timeout', (if ($env:REALITY_SCAN_TIMEOUT) { $env:REALITY_SCAN_TIMEOUT } else { '5' }),
+        '-port', $scanPort,
+        '-thread', $scanThread,
+        '-timeout', $scanTimeout,
         '-out', $out
     )
 
@@ -645,7 +658,8 @@ function Apply-RealityScannerResult {
     $cols = $line -split ','
     $ip = $cols[0].Trim(' ', '"', "`r")
     $origin = $cols[1].Trim(' ', '"', "`r")
-    $cert = if ($cols.Count -gt 2) { $cols[2].Trim(' ', '"', "`r") } else { '' }
+    $cert = ''
+    if ($cols.Count -gt 2) { $cert = $cols[2].Trim(' ', '"', "`r") }
     $sni = $cert
     if (-not $sni -or $sni.StartsWith('*.')) { $sni = $origin }
     if (-not $ip -or -not $sni -or $sni.Contains('*')) {
@@ -982,10 +996,12 @@ function Get-Info {
 
     Write-Green "`nArgoDomain: $argodomain`n"
 
-    $argoAdd = if ($env:XRAY2GO_ARGO_ADD) { $env:XRAY2GO_ARGO_ADD } else { $argodomain }
+    $argoAdd = $argodomain
+    if ($env:XRAY2GO_ARGO_ADD) { $argoAdd = $env:XRAY2GO_ARGO_ADD }
 
     # VMess JSON
-    $vmessPs = if ($script:XRAY2GO_ARGO_ONLY -eq '1') { "${isp}-vmess-argo-fixed" } else { $isp }
+    $vmessPs = $isp
+    if ($script:XRAY2GO_ARGO_ONLY -eq '1') { $vmessPs = "${isp}-vmess-argo-fixed" }
     $vmessObj = @{
         v    = '2'; ps = $vmessPs; add = $argoAdd; port = $CFPORT
         id   = $script:UUID; aid = '0'; scy = 'none'; net = 'ws'
@@ -1069,7 +1085,8 @@ function Export-ProxyTxt {
     $lineWs    = $urlContent | Where-Object { ($_ -match 'vless') -and ($_ -match 'ws') } | Select-Object -First 1
     $lineVmess = $urlContent | Where-Object { $_ -match '^vmess://' } | Select-Object -First 1
 
-    $adStr = if ($argodomain) { $argodomain } else { 'N/A' }
+    $adStr = 'N/A'
+    if ($argodomain) { $adStr = $argodomain }
     $argoDomain = Get-CurrentArgoDomain
     $subLink = Get-SubscriptionUrl -IP $IP -Port $subPort -Path $subPath -ArgoDomain $argoDomain
 
@@ -1171,18 +1188,18 @@ function Invoke-Xray2GoPsql {
     }
 
     if ($env:DATABASE_URL) {
-        $env:PGPASSWORD = if ($env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD } else { $env:PGPASSWORD }
+        if ($env:POSTGRES_PASSWORD) { $env:PGPASSWORD = $env:POSTGRES_PASSWORD }
         & psql $env:DATABASE_URL -v ON_ERROR_STOP=1 -q -f $SqlFile
     }
     elseif ($env:PGSTATS_DSN) {
         & psql $env:PGSTATS_DSN -v ON_ERROR_STOP=1 -q -f $SqlFile
     }
     else {
-        $env:PGHOST = if ($env:POSTGRES_HOST) { $env:POSTGRES_HOST } elseif ($env:PGHOST) { $env:PGHOST } else { '127.0.0.1' }
-        $env:PGPORT = if ($env:POSTGRES_PORT) { $env:POSTGRES_PORT } elseif ($env:PGPORT) { $env:PGPORT } else { '5432' }
-        $env:PGUSER = if ($env:POSTGRES_USER) { $env:POSTGRES_USER } elseif ($env:PGUSER) { $env:PGUSER } else { 'postgres' }
-        $env:PGPASSWORD = if ($env:POSTGRES_PASSWORD) { $env:POSTGRES_PASSWORD } else { $env:PGPASSWORD }
-        $env:PGDATABASE = if ($env:POSTGRES_DB) { $env:POSTGRES_DB } elseif ($env:PGDATABASE) { $env:PGDATABASE } else { 'xray' }
+        if ($env:POSTGRES_HOST) { $env:PGHOST = $env:POSTGRES_HOST } elseif (-not $env:PGHOST) { $env:PGHOST = '127.0.0.1' }
+        if ($env:POSTGRES_PORT) { $env:PGPORT = $env:POSTGRES_PORT } elseif (-not $env:PGPORT) { $env:PGPORT = '5432' }
+        if ($env:POSTGRES_USER) { $env:PGUSER = $env:POSTGRES_USER } elseif (-not $env:PGUSER) { $env:PGUSER = 'postgres' }
+        if ($env:POSTGRES_PASSWORD) { $env:PGPASSWORD = $env:POSTGRES_PASSWORD }
+        if ($env:POSTGRES_DB) { $env:PGDATABASE = $env:POSTGRES_DB } elseif (-not $env:PGDATABASE) { $env:PGDATABASE = 'xray' }
         & psql -v ON_ERROR_STOP=1 -q -f $SqlFile
     }
     return ($LASTEXITCODE -eq 0)
@@ -1241,14 +1258,19 @@ function Upload-LinksLatestToPostgres {
     $nodeHash = [BitConverter]::ToString($sha.ComputeHash($nodeBytes)).Replace('-', '').ToLower()
     $nodeId = $nodeHash.Substring(0, 24)
     $publicIp = Get-RealIP
-    $publicIpSql = if ($publicIp -and $publicIp -ne '127.0.0.1' -and $publicIp -notmatch ':') { (Quote-SqlText $publicIp) + '::inet' } else { 'NULL' }
-    $subUrl = if ($publicIp -and $script:PORT -and $script:password) { "http://${publicIp}:$($script:PORT)/$($script:password)" } else { '' }
-    $cdnHost = if ($meta.Contains('host')) { $meta['host'] } else { $CFIP }
+    $publicIpSql = 'NULL'
+    if ($publicIp -and $publicIp -ne '127.0.0.1' -and $publicIp -notmatch ':') { $publicIpSql = (Quote-SqlText $publicIp) + '::inet' }
+    $subUrl = ''
+    if ($publicIp -and $script:PORT -and $script:password) { $subUrl = "http://${publicIp}:$($script:PORT)/$($script:password)" }
+    $cdnHost = $CFIP
+    if ($meta.Contains('host')) { $cdnHost = $meta['host'] }
+    $publicIpForPayload = ''
+    if ($publicIp -and $publicIp -ne '127.0.0.1' -and $publicIp -notmatch ':') { $publicIpForPayload = $publicIp }
 
     $payload = [ordered]@{
         node_id = $nodeId
         hostname = $hostname
-        public_ip = if ($publicIp -and $publicIp -ne '127.0.0.1' -and $publicIp -notmatch ':') { $publicIp } else { '' }
+        public_ip = $publicIpForPayload
         install_dir = $WorkDir
         cdn_host = $cdnHost
         argo_domain = ''
@@ -1273,7 +1295,8 @@ VALUES ($(Quote-SqlText $nodeId), $(Quote-SqlText $hostname), $publicIpSql, $(Qu
 ON CONFLICT (node_id) DO UPDATE SET hostname=EXCLUDED.hostname, public_ip=EXCLUDED.public_ip, install_dir=EXCLUDED.install_dir, cdn_host=EXCLUDED.cdn_host, sub_url=EXCLUDED.sub_url, uuid=EXCLUDED.uuid, public_key=EXCLUDED.public_key, ports=EXCLUDED.ports, links=EXCLUDED.links, raw_ports_env=EXCLUDED.raw_ports_env, script_version=EXCLUDED.script_version, updated_at=now();
 "@
     }
-    $tmpRoot = if ($env:TEMP) { $env:TEMP } else { [IO.Path]::GetTempPath() }
+    $tmpRoot = [IO.Path]::GetTempPath()
+    if ($env:TEMP) { $tmpRoot = $env:TEMP }
     $tmp = Join-Path $tmpRoot "xray2go_links_pg_$([guid]::NewGuid().ToString('N')).sql"
     $sql | Out-File -FilePath $tmp -Encoding UTF8
     if (Invoke-Xray2GoPsql -SqlFile $tmp) {
